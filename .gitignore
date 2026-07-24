@@ -1,0 +1,10 @@
+# 산출물 · 원자료는 저장소에 넣지 않는다(용량 · 원자료 무결성)
+outputs/
+data/
+tests/sample/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+~$*.xlsx
+.streamlit/secrets.toml

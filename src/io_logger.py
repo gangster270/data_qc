@@ -284,11 +284,30 @@ def to_numeric_clean(series: pd.Series) -> tuple[pd.Series, int]:
     return num, n_error
 
 
+def _is_informative(series: pd.Series) -> bool:
+    """센서가 실제로 값을 내고 있는지 판정.
+
+    미연결 포트는 NaN 이 아니라 '전 구간 0' 또는 '전 구간 동일값'으로 나온다
+    (실측 사례: TEROS 2조가 처음부터 끝까지 0.00). 이런 열을 대표 센서로 뽑으면
+    변수 전체가 0 이 되므로, 반드시 정보가 있는 열을 우선한다.
+    """
+    s = series.dropna()
+    if s.empty:
+        return False
+    if (s == 0).all():
+        return False
+    return s.nunique() > 1
+
+
 def standardize(df: pd.DataFrame, replicate: str = "first") -> tuple[pd.DataFrame, pd.DataFrame]:
     """표준 변수키 열을 가진 깔끔한 DataFrame 을 만든다.
 
     replicate: 같은 변수의 중복 센서 처리 방식
         "first" (기본) | "mean"(공간반복 평균) | "keep"(temp_1, temp_2 로 모두 보존)
+
+    대표 센서는 '값이 살아 있는 첫 번째 열'을 고른다(전 구간 0·상수인 죽은 포트는
+    후순위로 밀고 리포트에 사유를 남긴다). 죽은 열도 열 자체는 보존해 QC 규칙이
+    고착(flatline)으로 잡아낼 수 있게 한다.
 
     반환: (표준화 DataFrame, 매핑 리포트)
     """
@@ -316,23 +335,33 @@ def standardize(df: pd.DataFrame, replicate: str = "first") -> tuple[pd.DataFram
         if not usable:
             continue
 
+        # 살아 있는 센서를 앞으로: 전 구간 0·상수인 죽은 포트가 대표가 되지 않도록 재정렬
+        alive = [c for c in usable if _is_informative(block[c])]
+        dead = [c for c in usable if c not in alive]
+        usable = alive + dead                     # 대표는 항상 alive 에서 먼저 고른다
+        dead_note = " ※죽은 포트(전 구간 0·상수)"
+
+        def _note(col: str, text: str) -> str:
+            return text + (dead_note if col in dead else "")
+
         if replicate == "keep" and len(usable) > 1:
             for i, c in enumerate(usable, start=1):
                 out[f"{key}_{i}"] = block[c].to_numpy()
-                rows[c]["채택"] = f"{key}_{i}"
-        elif replicate == "mean" and len(usable) > 1:
-            out[key] = block[usable].mean(axis=1).to_numpy()
-            # 중복 센서 편차 점검용으로 개별 열도 남긴다
+                rows[c]["채택"] = _note(c, f"{key}_{i}")
+        elif replicate == "mean" and len(alive) > 1:
+            # 평균은 살아 있는 센서끼리만. 죽은 0값을 섞으면 평균이 절반으로 꺼진다.
+            out[key] = block[alive].mean(axis=1).to_numpy()
             for i, c in enumerate(usable, start=1):
                 out[f"{key}__rep{i}"] = block[c].to_numpy()
-                rows[c]["채택"] = f"{key}(평균) / {key}__rep{i}"
+                rows[c]["채택"] = _note(c, f"{key}(평균 대상) / {key}__rep{i}" if c in alive
+                                        else f"{key}__rep{i}")
         else:
             first = usable[0]
             out[key] = block[first].to_numpy()
-            rows[first]["채택"] = key
+            rows[first]["채택"] = _note(first, key)
             for i, c in enumerate(usable[1:], start=2):
                 out[f"{key}__rep{i}"] = block[c].to_numpy()   # 상호비교용 보존
-                rows[c]["채택"] = f"{key}__rep{i}"
+                rows[c]["채택"] = _note(c, f"{key}__rep{i}")
 
     report = pd.DataFrame(list(rows.values()))
     ordered = ["timestamp"] + [c for c in STANDARD_ORDER if c in out.columns] + \

@@ -69,6 +69,9 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.json:
+        # stdout 을 JSON 전용으로 비운다(콘솔 알림문과 섞이면 파이프 파싱이 깨진다)
+        cfg["alerts"]["channels"]["console"] = False
     paths = expand_paths(args.env)
     if not paths:
         print("환경 파일을 찾지 못했습니다.", file=sys.stderr)

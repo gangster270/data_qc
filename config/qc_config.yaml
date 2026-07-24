@@ -27,11 +27,15 @@ preprocess:
 #    flat_n : 같은 값이 N회 연속이면 고착(flatline) 의심
 #    spike  : 10분 간 변화량이 이 값을 넘으면 급변(spike) 의심
 # ---------------------------------------------------------------------
+#    ※ 범위는 '센서 측정사양' 기준으로 넓게 잡는다. 작물 기준으로 좁게 잡으면
+#      실제 고온사고(예: 환기 실패로 70℃) 같은 진짜 사건이 오류로 지워진다.
+#      작물 위험 수준은 별도 규칙(heat_event)으로 경보한다.
 sensors:
-  temp:        {label: "온도",     unit: "℃",             min: -20,  max: 60,    flat_n: 36, spike: 5.0}
+  temp:        {label: "온도",     unit: "℃",             min: -40,  max: 80,    flat_n: 36, spike: 5.0}
   rh:          {label: "습도",     unit: "%",              min: 0,    max: 100,   flat_n: 36, spike: 30.0}
-  soil_temp:   {label: "배지온도", unit: "℃",             min: -10,  max: 60,    flat_n: 72, spike: 4.0}
-  vwc:         {label: "배지습도", unit: "m³/m³",          min: 0.0,  max: 0.75,  flat_n: 72, spike: 0.15}
+  soil_temp:   {label: "배지온도", unit: "℃",             min: -40,  max: 60,    flat_n: 72, spike: 4.0}
+  # METER TEROS 는 '% Water Content'(체적수분 ×100)로 내보낸다. m³/m³ 가 아니라 % 단위.
+  vwc:         {label: "배지습도", unit: "%",              min: 0.0,  max: 75.0,  flat_n: 72, spike: 15.0}
   ppfd:        {label: "PPFD",     unit: "µmol m-2 s-1",   min: 0,    max: 2500,  flat_n: 18, spike: 1500}
   solar:       {label: "일사량",   unit: "W/m²",           min: 0,    max: 1400,  flat_n: 18, spike: 800}
   ec:          {label: "EC",       unit: "mS/cm",          min: 0.0,  max: 20.0,  flat_n: 72, spike: 3.0}
@@ -51,7 +55,9 @@ qc:
 
   # 고착(flatline) — sensors.flat_n 회 연속 동일값
   flatline_enabled: true
-  flatline_ignore_zero: [ppfd, solar]   # 야간 0 연속은 정상 → 고착 판정 제외
+  # 0 연속이 정상인 변수: 광(야간), EC(배지 건조 시 TEROS 가 0 출력 — 고장 아님)
+  flatline_ignore_zero: [ppfd, solar, ec]
+  flatline_light_floor: 10              # 광센서는 이 값 이하(박명·야간)의 동일값도 정상으로 본다
 
   # 급변(spike)
   spike_enabled: true
@@ -66,6 +72,10 @@ qc:
   night_hours: [23, 3]          # 23시~익일 3시 (보광 시간대와 겹치지 않게 설정)
   night_light_enabled: false    # NI/SL 시험 중이면 false 유지
 
+  # 작물 고온 경보(센서 범위와 별개 — 값은 유효하지만 작물에 위험한 수준)
+  heat_event_temp: 45           # 일최고 기온이 이 값을 넘은 날
+  heat_event_soil_temp: 40      # 일최고 배지온도
+
   # 습도 포화 지속(결로/센서 고장)
   rh_saturated_hours: 12        # RH ≥ 99% 가 이 시간 이상 연속
 
@@ -78,7 +88,7 @@ qc:
     temp:      1.0     # ℃
     soil_temp: 1.0     # ℃
     rh:        5.0     # %
-    vwc:       0.05    # m³/m³
+    vwc:       5.0     # % (METER TEROS 는 % 단위 출력)
     ppfd:      0.15    # 상대편차 15%
 
   # 투과율(내부 PPFD / 외부 일사환산 PPFD) 급락 → 센서 오염·차광막
@@ -122,7 +132,7 @@ verification:
     temp: 0.5
     rh: 3.0
     soil_temp: 0.5
-    vwc: 0.03
+    vwc: 3.0               # % 단위(TEROS 출력 기준). m³/m³ 로 환산 시 0.03
     ec: 0.3
     ppfd_rel: 0.05         # 상대편차 5%
     solar_rel: 0.05

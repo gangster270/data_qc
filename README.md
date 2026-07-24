@@ -10,7 +10,7 @@
    ├─▶ [전처리]  10분 → 일별 → 생육 구간(시차 매칭) → merged_env_growth.csv
    │              scripts/run_preprocess.py · src/preprocess.py · R/env_growth_match.R
    │
-   ├─▶ [모니터링] 12종 QC 규칙 → 알림(콘솔/파일/Slack/메일) + 일일 리포트
+   ├─▶ [모니터링] 13종 QC 규칙 → 알림(콘솔/파일/Slack/메일) + 일일 리포트
    │              scripts/run_monitor.py · src/qc_rules.py · src/alerts.py
    │
    ├─▶ [대시보드] 4개 탭(모니터링·전처리·센서검증·설정)
@@ -68,7 +68,7 @@ R 버전(통계·그래프를 R 에서 이어갈 때): [`R/env_growth_match.R`](
 
 ---
 
-## 2. 자동 모니터링 — QC 규칙 12종
+## 2. 자동 모니터링 — QC 규칙 13종
 
 | 규칙 | 감지 대상 |
 |---|---|
@@ -84,12 +84,18 @@ R 버전(통계·그래프를 R 에서 이어갈 때): [`R/env_growth_match.R`](
 | R10 `pair_divergence` | 중복 센서 간 편차 초과(드리프트) |
 | R11 `transmittance_drop` | 내부PPFD/외부일사 비율 급락(오염·차광막) |
 | R12 `error_value` | `#VALUE!`·`ERROR`·`inf` 등 진성 오류값 |
+| R13 `heat_event` | 작물 위험 수준 고온(기온 45℃·배지온도 40℃ 초과) — 센서 오류가 아닌 실제 사건 |
 
 - 등급: INFO / WARN / CRITICAL. 종료코드 0·1·2 로 스케줄러에서 분기 가능.
 - **중복 억제**: 같은 이상은 `cooldown_hours`(기본 12h) 안에 재발송하지 않는다.
 - 알림 채널: 콘솔 · 파일(JSONL) · Slack(`SLACK_WEBHOOK_URL`) · 메일(`SMTP_*`).
   비밀값은 설정 파일이 아니라 **환경변수**로 넣는다.
 - 매 실행마다 `outputs/reports/qc_report_YYYY-MM-DD.md` 를 남긴다(알림이 없어도 기록).
+
+실측 로거 5대로 검증하며 반영한 규칙(상세: [`docs/logger_inventory.md`](docs/logger_inventory.md)):
+배지수분은 **% 단위**(METER TEROS 출력), 센서 범위는 **작물 기준이 아니라 센서 사양** 기준
+(실제 70℃ 고온사고가 오류로 지워지는 것 방지), EC 0 지속은 배지 건조 시 정상,
+미연결 포트(전 구간 0)는 고착과 구분해 경보.
 
 **NaN 은 오류가 아니다.** 중간에 설치된 센서의 앞부분 결측을 오류로 몰아 열을 통째로 버리지
 않도록, 열 제거·오류 판정은 진성 오류토큰에만 반응한다.
@@ -132,7 +138,7 @@ streamlit run app/streamlit_app.py
 | 분기 1회 | 기준기 대조(온습도계·광량자계·EC 표준액·중량법), 로거 시각 동기화 |
 | 2년 1회 | 제조사 재교정(SQ-521·PYR) |
 
-허용오차: 온도 ±0.5℃ · 습도 ±3% · 배지온도 ±0.5℃ · VWC ±0.03 · EC ±0.3 · PPFD/일사 ±5%
+허용오차: 온도 ±0.5℃ · 습도 ±3% · 배지온도 ±0.5℃ · 배지수분 ±3%(m³/m³ 환산 0.03) · EC ±0.3 · PPFD/일사 ±5%
 
 절차·체크리스트·기록양식: [`docs/sensor_verification_routine.md`](docs/sensor_verification_routine.md)
 기록 스키마: [`templates/sensor_calibration_log.csv`](templates/sensor_calibration_log.csv)
@@ -148,7 +154,7 @@ streamlit run app/streamlit_app.py
 config/qc_config.yaml          임계값·알림·검증주기 (단일 설정 지점)
 src/io_logger.py               ZL6 형식 읽기, 열 표준화, 10분 격자 정합
 src/preprocess.py              일별·구간 집계, 시차 매칭, 범위 이탈 처리
-src/qc_rules.py                QC 규칙 12종 + 센서 상태표
+src/qc_rules.py                QC 규칙 13종 + 센서 상태표
 src/alerts.py                  중복 억제, 리포트, 채널 발송
 src/sensor_check.py            검증 로그·기한·상호비교·드리프트
 scripts/run_preprocess.py      전처리 CLI
@@ -156,6 +162,7 @@ scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
 tests/                         합성 자료 생성기 + 검증 테스트 13종
+docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식
 ```
 

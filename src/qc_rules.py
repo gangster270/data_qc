@@ -210,29 +210,44 @@ def check_flatline(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) 
     ignore_zero = set(qc.get("flatline_ignore_zero", []))
     out = []
     for var, spec in cfg["sensors"].items():
-        if var not in df.columns:
+        # 대표 열뿐 아니라 중복 센서 열(var__rep2 …)도 점검한다.
+        # 미연결 포트는 '전 구간 0' 으로 나오므로 여기서 잡히지 않으면 조용히 묻힌다.
+        for col in [c for c in df.columns if c == var or c.startswith(f"{var}__rep")]:
+            out.extend(_flatline_for_column(df, col, var, spec, qc, ignore_zero, interval))
+    return out
+
+
+def _flatline_for_column(df, col, var, spec, qc, ignore_zero, interval) -> list[dict]:
+    """단일 열의 동일값 연속 구간을 찾아 알림 목록을 만든다."""
+    out: list[dict] = []
+    s = df[col]
+    if s.notna().sum() < 2:
+        return out
+    label = spec.get("label", var) + ("" if col == var else f"[{col}]")
+    same = s.eq(s.shift()) & s.notna()
+    if var in ignore_zero:
+        # 광센서: 야간·박명의 낮은 값 연속은 정상(분해능 한계)
+        # 그 외(EC 등): 0 연속만 정상으로 본다
+        #   TEROS 는 배지가 마르면(vwc<10%) EC 를 0 으로 출력한다 — 고장이 아니라 물리 현상
+        floor = qc.get("flatline_light_floor", 10) if var in ("ppfd", "solar") else 0
+        same &= s > floor
+    # 관측 전 구간이 한 값이면 고착이 아니라 미연결·고장 포트다
+    constant_all = s.dropna().nunique() <= 1
+    for pos, length in _run_lengths(same):
+        run_len = length + 1                       # shift 비교이므로 +1
+        if run_len < spec.get("flat_n", 36):
             continue
-        s = df[var]
-        if s.notna().sum() < 2:
-            continue
-        same = s.eq(s.shift()) & s.notna()
-        # 야간 PPFD/일사량 0 연속은 정상 → 0 값 구간은 고착에서 제외
-        if var in ignore_zero:
-            same &= s.ne(0)
-        for pos, length in _run_lengths(same):
-            run_len = length + 1                       # shift 비교이므로 +1
-            if run_len < spec.get("flat_n", 36):
-                continue
-            start = df["timestamp"].iloc[max(pos - 1, 0)]
-            end = df["timestamp"].iloc[pos + length - 1]
-            hours = run_len * interval / 60
-            level = "CRITICAL" if hours >= 12 else "WARN"
-            out.append(_alert(
-                "R04_flatline", level, var,
-                f"{spec.get('label', var)} 동일값({s.iloc[pos]:.3g}) {run_len}회 연속"
-                f"({hours:.1f}시간) — 센서 고착·통신 정지 의심",
-                start=start, end=end, value=float(s.iloc[pos]),
-            ))
+        start = df["timestamp"].iloc[max(pos - 1, 0)]
+        end = df["timestamp"].iloc[pos + length - 1]
+        hours = run_len * interval / 60
+        level = "CRITICAL" if hours >= 12 else "WARN"
+        cause = ("미연결·고장 포트(전 구간 동일값) — 배선·포트 설정 확인" if constant_all
+                 else "센서 고착·통신 정지 의심")
+        out.append(_alert(
+            "R04_flatline", level, var,
+            f"{label} 동일값({s.iloc[pos]:.3g}) {run_len}회 연속({hours:.1f}시간) — {cause}",
+            start=start, end=end, value=float(s.iloc[pos]), detail=col,
+        ))
     return out
 
 
@@ -317,6 +332,43 @@ def check_light_pattern(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=N
                     f"— 광 누출 또는 센서 오프셋(야간보광 처리구면 무시)",
                     start=pd.Timestamp(date), end=pd.Timestamp(date), value=float(vals.max()),
                 ))
+    return out
+
+
+# ---------------------------------------------------------------------
+# R13 고온 사건 (센서 오류가 아니라 '실제로 위험한 값')
+# ---------------------------------------------------------------------
+def check_heat_event(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) -> list[dict]:
+    """작물 위험 수준의 고온을 경보한다.
+
+    센서 물리범위(ATMOS 14: -40~80℃)는 통과하지만 작물에는 치명적인 값이 있다.
+    실측 사례: 환기 실패로 기온 70℃·배지온도 50℃가 한나절 지속. 이런 값은
+    지우면 안 되고(진짜 사건), 대신 즉시 알려야 한다.
+    """
+    qc = cfg["qc"]
+    df = _window(df10, lookback_days, now).copy()
+    if df.empty:
+        return []
+    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
+    interval = int(cfg["site"]["interval_minutes"])
+    out = []
+    for var, thr_key in (("temp", "heat_event_temp"), ("soil_temp", "heat_event_soil_temp")):
+        thr = qc.get(thr_key)
+        if var not in df.columns or thr is None:
+            continue
+        for date, g in df.groupby("date"):
+            s = g[var].dropna()
+            if s.empty or s.max() <= thr:
+                continue
+            n_over = int((s > thr).sum())
+            hours = n_over * interval / 60
+            level = "CRITICAL" if hours >= 1 else "WARN"
+            out.append(_alert(
+                "R13_heat_event", level, var,
+                f"{LABELS.get(var, var)} {thr}℃ 초과 {hours:.1f}시간 (최고 {s.max():.1f}℃, {date}) "
+                f"— 환기·차광 상태 확인, 해당 구간 생육자료 해석 주의",
+                start=pd.Timestamp(date), end=pd.Timestamp(date), value=float(s.max()),
+            ))
     return out
 
 
@@ -498,6 +550,7 @@ RULES = [
     ("R05", check_spike),
     ("R06", check_light_pattern),
     ("R08", check_rh_saturated),
+    ("R13", check_heat_event),
     ("R10", check_pair_divergence),
 ]
 

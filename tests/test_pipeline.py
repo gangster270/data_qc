@@ -300,6 +300,118 @@ def test_pair_divergence_disabled_by_default():
     print("✓ 중복센서 편차 규칙 기본 비활성")
 
 
+# ---------------------------------------------------------------------
+# 범용 형식 (ZL6 가 아닌 로거)
+# ---------------------------------------------------------------------
+def test_interval_detection():
+    """기록 간격을 자료에서 추정한다(1·5·15·30·60분)."""
+    for minutes in (1, 5, 15, 30, 60):
+        ts = pd.date_range("2026-05-01", periods=500, freq=f"{minutes}min")
+        assert io_logger.detect_interval_minutes(ts) == minutes
+    print("✓ 기록 간격 자동 추정")
+
+
+def test_split_date_time_columns(tmp_dir=None):
+    """날짜 열 + 시간 열이 분리된 형식도 한 시각으로 합쳐 읽는다."""
+    ts = pd.date_range("2026-06-01", periods=300, freq="1min")
+    df = pd.DataFrame({
+        "날짜": ts.strftime("%Y-%m-%d"), "시각": ts.strftime("%H:%M:%S"),
+        "온도(℃)": np.linspace(20, 25, len(ts)),
+        "상대습도(%)": np.linspace(60, 70, len(ts)),
+    })
+    out, rep = io_logger.prepare_timestamp(df)
+    assert rep["duplicate_rows"] == 0            # 날짜만 쓰면 대량 중복이 생긴다
+    assert rep["interval_minutes"] == 1
+    assert len(out) == len(ts)
+    std, _ = io_logger.standardize(out)
+    assert {"temp", "rh"} <= set(std.columns)
+    print("✓ 날짜/시간 분리 열 결합")
+
+
+def test_column_alias_matching():
+    """로거마다 다른 표기를 같은 변수로 인식한다(공백·대소문자·한글 무관)."""
+    cases = {
+        "SoilTemp": "soil_temp", "Soil Temperature": "soil_temp", "토양온도": "soil_temp",
+        "AirTemp": "temp", "외부온도": "temp", "기온": "temp",
+        "RH(%)": "rh", "상대습도": "rh",
+        "PAR": "ppfd", "광량": "ppfd",
+        "Water Content": "vwc", "토양수분": "vwc", "수분함량": "vwc",
+        "일사량": "solar", "CO2": "co2", "탄산가스": "co2",
+    }
+    for name, expected in cases.items():
+        assert io_logger._match_variable(name) == expected, f"{name} → {io_logger._match_variable(name)}"
+    # 오인식하면 안 되는 것들
+    for name in ("parameter", "Logger Temperature", "Battery Percent", "pH", "풍속"):
+        assert io_logger._match_variable(name) is None, name
+    print("✓ 변수명 별칭 인식")
+
+
+def test_unknown_variables_preserved_and_checked():
+    """표준 변수가 아닌 열(수온·pH·풍속)도 버리지 않고 집계·감시한다."""
+    ts = pd.date_range("2026-05-01", periods=144 * 5, freq="10min")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "수온": 18 + np.random.default_rng(0).normal(0, 0.3, len(ts)),
+        "pH": 6.2 + np.random.default_rng(1).normal(0, 0.05, len(ts)),
+    })
+    std, rep = io_logger.standardize(df)
+    assert {"수온", "ph"} <= set(std.columns)
+    assert (rep["채택"].str.contains("기타 변수")).any()
+
+    daily = preprocess.to_daily(std, interval_minutes=10)
+    assert {"수온_mean", "수온_min", "수온_max", "ph_mean"} <= set(daily.columns)
+
+    # 임계값이 없는 변수도 고착은 잡는다(12시간 동일값)
+    stuck = std.copy()
+    stuck.loc[stuck.index[:72 * 2], "수온"] = 18.0
+    alerts = qc_rules.run_all(stuck, CFG, lookback_days=10, now=str(ts.max()))
+    assert any(a.startswith("R04") for a in alerts["rule"]), alerts["rule"].tolist()
+    print("✓ 미인식 변수 보존 · 집계 · 감시")
+
+
+def test_hourly_logger_end_to_end():
+    """1시간 간격 로거도 결측·고착 판정이 시간 기준으로 정확히 동작한다."""
+    ts = pd.date_range("2026-05-01", periods=24 * 20, freq="1h")
+    hour = ts.hour
+    df = pd.DataFrame({
+        "datetime": ts.strftime("%Y/%m/%d %H:%M"),
+        "AirTemp": 20 + 8 * np.sin((hour - 9) / 24 * 2 * np.pi),
+        "PAR": np.clip(np.sin((hour - 6) / 13 * np.pi), 0, None) * 1100,
+    })
+    # 3시간 기록 누락 + 온도 8시간 고착 주입
+    df = df.drop(index=range(100, 103)).reset_index(drop=True)
+    df.loc[200:207, "AirTemp"] = 21.5
+
+    out, rep = io_logger.prepare_timestamp(df)
+    assert rep["interval_minutes"] == 60
+    std, _ = io_logger.standardize(out)
+    grid, gaps = io_logger.reindex_full_grid(std)          # 간격 자동
+    assert len(gaps) == 1 and int(gaps.iloc[0]["결측시간_분"]) == 180
+
+    daily = preprocess.to_daily(grid.drop(columns=["qc_status"]))
+    assert daily["expected_records"].iloc[0] == 24        # 1시간 → 하루 24 레코드
+    assert daily["completeness"].max() <= 1.0
+
+    alerts = qc_rules.run_all(grid, CFG, lookback_days=30, now=str(grid["timestamp"].max()))
+    rules = set(alerts["rule"])
+    assert "R01_timestamp_gap" in rules                    # 3시간 누락
+    assert "R04_flatline" in rules                         # 8시간 고착(기준 6시간)
+    assert "R00_rule_error" not in rules, alerts[alerts.rule == "R00_rule_error"]["message"].tolist()
+    print("✓ 1시간 간격 로거 전 과정")
+
+
+def test_flat_and_spike_scale_with_interval():
+    """고착 기준은 '시간', 급변 기준은 '간격'에 맞춰 환산된다."""
+    spec = {"flat_minutes": 360, "spike": 5.0}
+    assert qc_rules.flat_count(spec, 10) == 36            # 6시간 = 10분 × 36
+    assert qc_rules.flat_count(spec, 1) == 360            # 1분 로거는 360회
+    assert qc_rules.flat_count(spec, 60) == 6             # 1시간 로거는 6회
+    assert qc_rules.spike_threshold(spec, 10) == 5.0
+    assert qc_rules.spike_threshold(spec, 1) == 0.5       # 1분당 허용 변화는 1/10
+    assert qc_rules.spike_threshold({"spike": None}, 10) is None
+    print("✓ 간격에 따른 고착·급변 기준 환산")
+
+
 def test_judge_tolerance():
     assert sensor_check.judge("temp", 0.3, 20.0, CFG)[0] == "pass"
     assert sensor_check.judge("temp", 0.8, 20.0, CFG)[0] == "fail"

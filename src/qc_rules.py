@@ -1,7 +1,12 @@
 """결측 · 센서 오류 자동 감지 규칙 엔진.
 
-표준화된 10분 자료(timestamp + temp/rh/soil_temp/vwc/ppfd/solar/ec/co2)를 받아
-규칙별로 이상을 찾고 알림 레코드(DataFrame)를 만든다.
+표준화된 환경자료(timestamp + 측정값 열)를 받아 규칙별로 이상을 찾고
+알림 레코드(DataFrame)를 만든다.
+
+**로거 기종·기록간격에 의존하지 않는다.**
+  - 기록 간격(1·5·10·15·30·60분 …)은 자료에서 자동 추정해 모든 판정에 반영한다.
+  - 표준 변수(temp/rh/soil_temp/vwc/ppfd/solar/ec/co2)가 아닌 열(CO2·풍속·수온 등)도
+    결측·고착 규칙을 그대로 적용한다(범위 임계값이 없으면 범위 판정만 건너뛴다).
 
 규칙 목록
 ---------
@@ -9,13 +14,15 @@ R01 timestamp_gap        기록 누락(연속 결측 구간)
 R02 missing_ratio        변수별 일 결측률 초과
 R03 out_of_range         물리적으로 불가능한 값
 R04 flatline             동일값 연속(센서 고착·통신 정지)
-R05 spike                10분 간 비현실적 급변
+R05 spike                기록 간격 대비 비현실적 급변
 R06 daytime_dark         주간에 광센서가 어두움(탈락·차폐·오염)
 R07 night_light          야간 광 검출(광 누출·오프셋) ※ 야간보광 시험은 기본 비활성
 R08 rh_saturated         습도 99% 이상 장시간 지속(결로·고장)
 R09 logger_offline       최신 관측이 오래됨(통신 두절·전원)
 R10 pair_divergence      중복 센서 간 편차 초과(드리프트)
 R11 transmittance_drop   내부PPFD/외부일사 비율 급락(오염·차광)
+R12 error_value          #VALUE!·ERROR 등 진성 오류값
+R13 heat_event           작물 위험 수준 고온(센서 오류 아님)
 
 각 레코드: level(INFO/WARN/CRITICAL), rule, variable, 기간, 값, 메시지, dedup key
 """
@@ -31,6 +38,67 @@ from .io_logger import LABELS
 
 LEVEL_ORDER = {"INFO": 0, "WARN": 1, "CRITICAL": 2}
 STD_VARS = ["temp", "rh", "soil_temp", "vwc", "ppfd", "solar", "ec", "co2"]
+
+# 임계값이 정의되지 않은 '기타 변수'(CO2·풍속·수온·pH 등)에 적용할 기본 사양.
+# 범위는 두지 않고(오탐 방지) 고착·결측만 본다.
+DEFAULT_SPEC = {"min": -np.inf, "max": np.inf, "flat_minutes": 720, "spike": None}
+
+NON_VALUE_COLS = {"timestamp", "date", "hour", "qc_status", "_source_file", "trt"}
+
+
+def resolve_interval(cfg: dict, df: pd.DataFrame | None = None) -> float:
+    """기록 간격(분)을 정한다.
+
+    설정이 'auto'(또는 비어 있음)면 **자료에서 자동 추정**한다. 10분 로거뿐 아니라
+    1·5·15·30·60분 자료도 그대로 처리하기 위한 진입점이다.
+    """
+    raw = (cfg.get("site") or {}).get("interval_minutes", "auto")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    if df is not None and "timestamp" in getattr(df, "columns", []) and len(df) > 2:
+        from .io_logger import detect_interval_minutes
+        return detect_interval_minutes(df["timestamp"])
+    return 10.0
+
+
+def value_columns(df: pd.DataFrame, include_replicates: bool = False) -> list[str]:
+    """자료의 실제 측정값 열 목록(표준 변수 + 기타 변수)."""
+    cols = []
+    for c in df.columns:
+        if c in NON_VALUE_COLS or (not include_replicates and "__rep" in str(c)):
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            cols.append(c)
+    return cols
+
+
+def spec_for(cfg: dict, var: str) -> dict:
+    """변수의 QC 사양. 설정에 없으면 기본 사양(범위 없음)을 돌려준다."""
+    base = str(var).split("__rep")[0]
+    spec = (cfg.get("sensors") or {}).get(base)
+    if spec:
+        return {**DEFAULT_SPEC, **spec}
+    return {**DEFAULT_SPEC, "label": base}
+
+
+def flat_count(spec: dict, interval_minutes: float) -> int:
+    """고착 판정에 필요한 연속 횟수를 '지속시간' 기준으로 환산한다.
+
+    횟수를 그대로 쓰면 1분 로거에서는 36회=36분, 1시간 로거에서는 36회=36시간이
+    되어 기준이 뒤죽박죽이 된다. 항상 분 단위로 환산한다.
+    """
+    minutes = spec.get("flat_minutes")
+    if minutes is None:
+        minutes = float(spec.get("flat_n", 36)) * 10      # 기존 설정(10분 기준 횟수) 호환
+    return max(int(round(float(minutes) / max(interval_minutes, 0.01))), 2)
+
+
+def spike_threshold(spec: dict, interval_minutes: float) -> float | None:
+    """급변 임계값을 기록 간격에 맞춰 환산(설정값은 10분당 변화량 기준)."""
+    thr = spec.get("spike")
+    if thr is None:
+        return None
+    return float(thr) * (interval_minutes / 10.0)
 
 
 def _alert(rule, level, variable, message, *, start=None, end=None, value=None, detail=None) -> dict:
@@ -95,7 +163,7 @@ def check_timestamp_gaps(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=
     10분 격자로 이미 정합된 자료(qc_status 열 존재)면 삽입된 빈 행을 기준으로,
     그렇지 않으면 timestamp 간격으로 판정한다.
     """
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = resolve_interval(cfg, df10)
     qc = cfg["qc"]
     df = _window(df10, lookback_days, now).sort_values("timestamp").reset_index(drop=True)
     if len(df) < 2:
@@ -142,9 +210,9 @@ def check_timestamp_gaps(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=
 # R02 변수별 일 결측률
 # ---------------------------------------------------------------------
 def check_missing_ratio(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) -> list[dict]:
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = resolve_interval(cfg, df10)
     qc = cfg["qc"]
-    expected = int(24 * 60 / interval)
+    expected = max(int(round(24 * 60 / interval)), 1)
     df = _window(df10, lookback_days, now).copy()
     if df.empty:
         return []
@@ -158,7 +226,7 @@ def check_missing_ratio(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=N
     evaluable = {d for d in counts.index if d in full_days or d not in edge_days}
 
     out = []
-    for var in [v for v in STD_VARS if v in df.columns]:
+    for var in value_columns(df):
         # 관측기간 내내 비어 있는 변수(미설치)는 결측 알림 대상에서 제외
         if df[var].notna().sum() == 0:
             continue
@@ -190,9 +258,8 @@ def check_out_of_range(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=No
         return []
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
     out = []
-    for var, spec in cfg["sensors"].items():
-        if var not in df.columns:
-            continue
+    for var in value_columns(df):
+        spec = spec_for(cfg, var)
         s = df[var]
         bad = s.notna() & ((s < spec["min"]) | (s > spec["max"]))
         if not bad.any():
@@ -217,11 +284,12 @@ def check_flatline(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) 
     qc = cfg["qc"]
     if not qc.get("flatline_enabled", True):
         return []
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = resolve_interval(cfg, df10)
     df = _window(df10, lookback_days, now).sort_values("timestamp").reset_index(drop=True)
     ignore_zero = set(qc.get("flatline_ignore_zero", []))
     out = []
-    for var, spec in cfg["sensors"].items():
+    for var in value_columns(df):
+        spec = spec_for(cfg, var)
         # 센서가 여러 개면 개별 열(var__rep1..N)을 점검한다. 대표 열(var)은 그중
         # 하나의 복사본이므로 중복 알림을 피하려 건너뛴다.
         # 미연결 포트는 '전 구간 0' 으로 나오므로 여기서 잡지 않으면 조용히 묻힌다.
@@ -248,7 +316,7 @@ def _flatline_for_column(df, col, var, spec, qc, ignore_zero, interval) -> list[
     constant_all = s.dropna().nunique() <= 1
     for pos, length in _run_lengths(same):
         run_len = length + 1                       # shift 비교이므로 +1
-        if run_len < spec.get("flat_n", 36):
+        if run_len < flat_count(spec, interval):
             continue
         start = df["timestamp"].iloc[max(pos - 1, 0)]
         end = df["timestamp"].iloc[pos + length - 1]
@@ -271,15 +339,17 @@ def check_spike(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) -> 
     qc = cfg["qc"]
     if not qc.get("spike_enabled", True):
         return []
+    interval = resolve_interval(cfg, df10)
     df = _window(df10, lookback_days, now).sort_values("timestamp").copy()
     if df.empty:
         return []
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
     out = []
-    for var, spec in cfg["sensors"].items():
-        if var not in df.columns or var in ("ppfd", "solar"):
+    for var in value_columns(df):
+        if var in ("ppfd", "solar"):
             continue                                   # 광은 구름에 의해 정상적으로 급변
-        thr = spec.get("spike")
+        spec = spec_for(cfg, var)
+        thr = spike_threshold(spec, interval)
         if thr is None:
             continue
         d = df[var].diff().abs()
@@ -292,7 +362,7 @@ def check_spike(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) -> 
                 continue
             out.append(_alert(
                 "R05_spike", "WARN", var,
-                f"{spec.get('label', var)} 10분간 {thr}{spec.get('unit','')} 초과 급변 {n}회 ({date}) "
+                f"{spec.get('label', var)} {interval:g}분간 {thr:g}{spec.get('unit','')} 초과 급변 {n}회 ({date}) "
                 f"— 접촉불량·노이즈 의심",
                 start=pd.Timestamp(date), end=pd.Timestamp(date), value=n,
             ))
@@ -363,7 +433,7 @@ def check_heat_event(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None
     if df.empty:
         return []
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = resolve_interval(cfg, df10)
     out = []
     for var, thr_key in (("temp", "heat_event_temp"), ("soil_temp", "heat_event_soil_temp")):
         thr = qc.get(thr_key)
@@ -391,7 +461,7 @@ def check_heat_event(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None
 def check_rh_saturated(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) -> list[dict]:
     if "rh" not in df10.columns:
         return []
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = resolve_interval(cfg, df10)
     hours_thr = cfg["qc"].get("rh_saturated_hours", 12)
     need = int(hours_thr * 60 / interval)
     df = _window(df10, lookback_days, now).sort_values("timestamp").reset_index(drop=True)
@@ -625,7 +695,7 @@ def health_score(df10: pd.DataFrame, cfg: dict, days: int = 7) -> pd.DataFrame:
 
     수신율 · 범위이탈률 · 최근값 · 마지막 유효 관측시각을 한 표로 정리한다.
     """
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = resolve_interval(cfg, df10)
     if df10.empty:
         return pd.DataFrame()
     end = pd.Timestamp(df10["timestamp"].max())
@@ -633,9 +703,8 @@ def health_score(df10: pd.DataFrame, cfg: dict, days: int = 7) -> pd.DataFrame:
     sub = df10[df10["timestamp"] > end - pd.Timedelta(days=days)]
     expected = int(days * 24 * 60 / interval)
     rows = []
-    for var, spec in cfg["sensors"].items():
-        if var not in sub.columns:
-            continue
+    for var in value_columns(sub):
+        spec = spec_for(cfg, var)
         s = sub[var]
         if s.notna().sum() == 0 and df10[var].notna().sum() == 0:
             continue                                    # 미설치 센서는 표에서 제외

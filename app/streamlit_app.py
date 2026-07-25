@@ -36,24 +36,30 @@ STATUS_COLOR = {"정상": "#2e8b57", "주의": "#e08b3a", "위험": "#d64545"}
 # =====================================================================
 # 데이터 로딩
 # =====================================================================
+def _process(raw, log, cfg, replicate, overrides):
+    """읽은 원자료를 표준화 + 격자 정합까지 처리(로거 기종·간격 무관)."""
+    ts_df, ts_report = io_logger.prepare_timestamp(raw)
+    interval = qc_rules.resolve_interval(cfg, ts_df)      # 설정이 auto 면 자료에서 추정
+    std, map_report = io_logger.standardize(ts_df, replicate=replicate, overrides=overrides)
+    grid, gap_report = io_logger.reindex_full_grid(std, interval_minutes=interval)
+    ts_report["interval_minutes"] = interval
+    return grid, map_report, gap_report, ts_report, log
+
+
 @st.cache_data(show_spinner=False)
-def load_from_bytes(files: list[tuple[str, bytes]], interval: int, replicate: str):
-    """업로드된 파일들을 표준화 + 10분 격자 정합까지 처리(캐시)."""
+def load_from_bytes(files: list[tuple[str, bytes]], _cfg: dict, replicate: str,
+                    overrides_key: tuple = ()):
+    """업로드된 파일들을 읽어 처리(캐시). 어떤 형식이든 자동 인식한다."""
     sources = [(io.BytesIO(b), name) for name, b in files]
     raw, log = io_logger.load_env_files(sources)
-    ts_df, ts_report = io_logger.prepare_timestamp(raw)
-    std, map_report = io_logger.standardize(ts_df, replicate=replicate)
-    grid, gap_report = io_logger.reindex_full_grid(std, interval_minutes=interval)
-    return grid, map_report, gap_report, ts_report, log
+    return _process(raw, log, _cfg, replicate, dict(overrides_key))
 
 
 @st.cache_data(show_spinner=False)
-def load_from_paths(paths: tuple[str, ...], interval: int, replicate: str):
+def load_from_paths(paths: tuple[str, ...], _cfg: dict, replicate: str,
+                    overrides_key: tuple = ()):
     raw, log = io_logger.load_env_files(list(paths))
-    ts_df, ts_report = io_logger.prepare_timestamp(raw)
-    std, map_report = io_logger.standardize(ts_df, replicate=replicate)
-    grid, gap_report = io_logger.reindex_full_grid(std, interval_minutes=interval)
-    return grid, map_report, gap_report, ts_report, log
+    return _process(raw, log, _cfg, replicate, dict(overrides_key))
 
 
 def df_download(df: pd.DataFrame, label: str, filename: str, key: str | None = None):
@@ -76,27 +82,33 @@ def excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
 # =====================================================================
 cfg = load_config()
 st.sidebar.title("🌱 환경데이터 QC")
-st.sidebar.caption(f"현장: {cfg['site'].get('name', '-')} · 기록간격 {cfg['site']['interval_minutes']}분")
+st.sidebar.caption(f"현장: {cfg['site'].get('name', '-')} · "
+                   f"기록간격 {cfg['site'].get('interval_minutes', 'auto')}")
 
+st.sidebar.markdown("**① 파일 넣기 → ② 탭에서 확인**")
 source_mode = st.sidebar.radio("데이터 입력", ["파일 업로드", "서버 경로"], horizontal=True)
 replicate = st.sidebar.selectbox(
     "중복 센서 처리", ["first", "mean", "keep"], index=0,
-    help="같은 변수 센서가 여러 개일 때: first=첫 센서, mean=평균(공간반복), keep=모두 보존")
+    help="같은 변수 센서가 여러 개일 때: first=첫 센서, mean=평균(같은 위치 반복일 때만), keep=모두 보존")
 
+overrides = st.session_state.get("col_overrides", {})
+overrides_key = tuple(sorted(overrides.items()))
 grid = map_report = gap_report = ts_report = None
 load_log: list[str] = []
 
 if source_mode == "파일 업로드":
-    ups = st.sidebar.file_uploader("로거 파일(.xlsx/.csv, 복수 가능)",
-                                   type=["xlsx", "xls", "csv"], accept_multiple_files=True)
+    ups = st.sidebar.file_uploader(
+        "환경 로거 파일 (.xlsx/.xls/.csv/.txt, 여러 개 가능)",
+        type=["xlsx", "xls", "csv", "txt", "tsv"], accept_multiple_files=True,
+        help="ZL6 뿐 아니라 어떤 로거 파일이든 시간 열만 있으면 자동 인식합니다.")
     if ups:
         payload = [(u.name, u.getvalue()) for u in ups]
         st.session_state["loaded_names"] = [u.name for u in ups]
         with st.spinner("파일 처리 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_bytes(
-                payload, int(cfg["site"]["interval_minutes"]), replicate)
+                payload, cfg, replicate, overrides_key)
 else:
-    pattern = st.sidebar.text_input("파일 경로/글롭", value="tests/sample/*.xlsx")
+    pattern = st.sidebar.text_input("파일 경로/글롭", value="data/*.xlsx")
     if st.sidebar.button("불러오기", type="primary"):
         import glob
         paths = tuple(sorted(glob.glob(str(PROJECT_ROOT / pattern) if not Path(pattern).is_absolute() else pattern))
@@ -109,13 +121,47 @@ else:
         st.session_state["loaded_names"] = [Path(p).name for p in st.session_state["paths"]]
         with st.spinner("파일 처리 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_paths(
-                st.session_state["paths"], int(cfg["site"]["interval_minutes"]), replicate)
+                st.session_state["paths"], cfg, replicate, overrides_key)
 
 if grid is not None:
-    st.sidebar.success(f"{len(grid):,}행 로드 · {ts_report['start']:%Y-%m-%d} ~ {ts_report['end']:%Y-%m-%d}")
+    st.sidebar.success(f"{len(grid):,}행 · {ts_report['start']:%Y-%m-%d} ~ {ts_report['end']:%Y-%m-%d}")
+
+    # --- 자동 인식 결과: 무엇을 어떻게 읽었는지 항상 보이게 --------------
+    with st.sidebar.expander("🔍 자동 인식 결과 / 수정", expanded=False):
+        st.write(f"- **시간 열**: `{ts_report['timestamp_column']}`")
+        st.write(f"- **기록 간격**: {ts_report.get('interval_minutes', 10):g}분 (자동 추정)")
+        st.write(f"- **중복 timestamp**: {ts_report['duplicate_rows']:,}건 제거")
+        detected = [c for c in qc_rules.value_columns(grid)]
+        st.write(f"- **인식 변수({len(detected)})**: " +
+                 ", ".join(f"`{c}`" for c in detected))
+        st.caption("표준 변수로 인식되지 않은 열도 이름 그대로 보존되어 집계·감시됩니다.")
+
+        if map_report is not None and not map_report.empty:
+            st.markdown("**열 매핑을 고치려면** (자동 인식이 틀렸을 때만)")
+            options = ["(자동)"] + io_logger.STANDARD_ORDER + ["제외"]
+            src_cols = map_report["원본열"].astype(str).tolist()
+            pick_col = st.selectbox("원본 열", src_cols, key="ov_col")
+            pick_var = st.selectbox("이 열의 의미", options, key="ov_var")
+            c1, c2 = st.columns(2)
+            if c1.button("적용", key="ov_apply"):
+                ov = dict(st.session_state.get("col_overrides", {}))
+                if pick_var == "(자동)":
+                    ov.pop(pick_col, None)
+                else:
+                    ov[pick_col] = pick_var
+                st.session_state["col_overrides"] = ov
+                st.rerun()
+            if c2.button("초기화", key="ov_reset"):
+                st.session_state["col_overrides"] = {}
+                st.rerun()
+            if overrides:
+                st.info("수동 지정: " + ", ".join(f"{k}→{v}" for k, v in overrides.items()))
+
     with st.sidebar.expander("로드 로그"):
         for line in load_log:
             st.write("- " + line)
+else:
+    st.sidebar.info("파일을 넣으면 아래 4개 탭이 채워집니다.")
 
 tab_mon, tab_pre, tab_ver, tab_cfg = st.tabs(
     ["📊 모니터링", "🔁 전처리(생육 매칭)", "🔬 센서 정기검증", "⚙️ 설정"])
@@ -126,8 +172,18 @@ tab_mon, tab_pre, tab_ver, tab_cfg = st.tabs(
 # =====================================================================
 with tab_mon:
     st.header("결측 · 센서오류 자동 모니터링")
+    with st.expander("❓ 이 화면 보는 법", expanded=False):
+        st.markdown("""
+1. **상단 숫자 5개** — 알림 건수(전체/CRITICAL/WARN), 결측 timestamp, 관측 일수.
+   빨간 CRITICAL 이 0 이면 오늘은 조치할 게 없습니다.
+2. **센서 상태** — 변수별 수신율·범위이탈·최근값. '정상/주의/위험'으로 표시됩니다.
+3. **알림 목록** — 무엇이·언제·왜 이상한지. CSV 로 내려받아 보고서에 붙일 수 있습니다.
+4. **일자별 결측률** — 날짜×변수 히트맵. 진한 칸이 그날 그 센서가 비어 있던 구간입니다.
+5. **시계열 확인** — 의심 변수를 골라 실제 곡선으로 확인합니다.
+6. **알림 발송** — Slack·메일로 보내거나(설정 탭에서 채널 켜기), 리포트만 미리봅니다.
+""")
     if grid is None:
-        st.info("왼쪽에서 환경 로거 파일을 불러오세요.")
+        st.info("왼쪽 사이드바에서 환경 로거 파일을 불러오세요. (ZL6·국산로거·자체 CSV 모두 가능)")
     else:
         c1, c2, c3 = st.columns([1, 1, 2])
         lookback = c1.number_input("점검 기간(일)", 1, 365, 7)
@@ -175,13 +231,14 @@ with tab_mon:
 
         # --- 결측 히트맵 (날짜 × 변수) -----------------------------------
         st.subheader("일자별 결측률")
-        interval = int(cfg["site"]["interval_minutes"])
-        expected = int(24 * 60 / interval)
+        interval = ts_report.get("interval_minutes", 10)
+        expected = max(int(round(24 * 60 / interval)), 1)
         tmp = grid.copy()
         tmp["date"] = tmp["timestamp"].dt.date
         varcols = [c for c in qc_rules.STD_VARS if c in tmp.columns and tmp[c].notna().any()]
         if varcols:
             miss = (1 - tmp.groupby("date")[varcols].count() / expected).round(3).reset_index()
+            miss["date"] = pd.to_datetime(miss["date"]).dt.strftime("%m-%d")   # 축 라벨용 문자열
             long = miss.melt(id_vars="date", var_name="변수", value_name="결측률")
             long["변수"] = long["변수"].map(io_logger.LABELS).fillna(long["변수"])
             import altair as alt
@@ -233,10 +290,20 @@ with tab_mon:
 # 2. 전처리 탭
 # =====================================================================
 with tab_pre:
-    st.header("10분 환경 → 생육조사 구간 시차 매칭")
+    st.header("환경 → 생육조사 구간 시차 매칭")
     st.caption("생육은 구간 누적 반응이므로, 조사일 하루가 아니라 **직전 조사일 다음날~당일** 구간을 집계해 매칭합니다.")
+    with st.expander("❓ 이 화면 보는 법 (수작업 대체 순서)", expanded=False):
+        st.markdown("""
+1. **위쪽 설정** — GDD 기준온도, 시차(일), 고정창 사용 여부, 범위 이탈값 처리.
+   기본값 그대로 두어도 됩니다. 시차는 '환경이 며칠 뒤 생육에 반영되는가'를 볼 때만 씁니다.
+2. **① 일별 요약** — 10분(또는 1·15·60분) 자료가 하루 단위로 접힌 표. DLI·평균기온·완전성 포함.
+3. **② 생육조사 자료 업로드** — `date`(조사일) 열이 있는 csv/xlsx. 조사간격(7·10일)은 자동 인식.
+4. **③ 구간 정의** — 각 조사일에 어떤 환경 기간이 붙었는지 확인합니다.
+5. **④ 구간별 환경 요약 / ⑤ 생육+환경 병합** — 마지막 표가 분석에 바로 쓰는 파일입니다.
+6. **다운로드** — `merged_env_growth.csv` 또는 Excel 일괄. R 통계·그래프로 그대로 넘기면 됩니다.
+""")
     if grid is None:
-        st.info("왼쪽에서 환경 로거 파일을 먼저 불러오세요.")
+        st.info("왼쪽 사이드바에서 환경 로거 파일을 먼저 불러오세요.")
     else:
         pcfg = cfg["preprocess"]
         c1, c2, c3, c4 = st.columns(4)
@@ -260,7 +327,7 @@ with tab_pre:
                            ", ".join(f"{r['변수']} {r['결측처리건수']:,}건" for _, r in range_report.iterrows()))
 
         daily_kwargs = dict(
-            interval_minutes=int(cfg["site"]["interval_minutes"]),
+            interval_minutes=ts_report.get("interval_minutes", None),
             gdd_base=float(gdd_base),
             photoperiod_ppfd_threshold=float(pcfg.get("photoperiod_ppfd_threshold", 10)),
             daytime_hours=tuple(pcfg.get("daytime_hours", [9, 15])),
@@ -427,6 +494,14 @@ with tab_pre:
 with tab_ver:
     st.header("센서 정기 검증 루틴")
     st.caption("절차 상세는 docs/sensor_verification_routine.md 참조")
+    with st.expander("❓ 이 화면 보는 법", expanded=False):
+        st.markdown("""
+1. **① 검증 기한 현황** — 센서별로 다음 점검일과 지연 여부. '지연/미실시'가 있으면 그것부터 처리합니다.
+2. **② 현장 상호비교** — 두 센서를 24시간 나란히 두고 기록한 뒤, 두 열을 골라 실행하면
+   편차(bias)·MAE·상관 r·합격 여부가 계산됩니다.
+3. **③ 검증 결과 기록** — 점검·비교 결과를 남깁니다(편차·합격 판정 자동 계산).
+4. **④ 검증 이력·드리프트** — 반복 기록이 쌓이면 연간 드리프트를 추정해 교체 시기를 판단합니다.
+""")
 
     sched = cfg["verification"].get("schedule_days", {})
     cols = st.columns(len(sched))
@@ -532,6 +607,13 @@ with tab_ver:
 with tab_cfg:
     st.header("설정")
     st.caption(f"설정 파일: {cfg.get('_path')}")
+    with st.expander("❓ 이 화면 보는 법", expanded=False):
+        st.markdown("""
+- 여기 표시되는 값은 **`config/qc_config.yaml` 을 읽은 결과**입니다. 화면에서 바꾸는 게 아니라
+  그 파일을 수정하고 새로고침(F5)하면 반영됩니다.
+- 임계값을 바꾸고 싶을 때(예: 결측 경보 기준, 고온 경보 온도) 이 표에서 현재 값을 확인하세요.
+- 알림 채널은 환경변수(`SLACK_WEBHOOK_URL`, `SMTP_*`)를 설정한 뒤 yaml 에서 `true` 로 켭니다.
+""")
 
     st.subheader("센서 물리범위 · 이상 판정 임계값")
     sens = pd.DataFrame(cfg["sensors"]).T.reset_index().rename(columns={"index": "변수키"})

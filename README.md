@@ -1,8 +1,15 @@
 # data_qc — 환경데이터 전처리 · QC 자동 모니터링 · 센서 검증
 
-10분 단위 환경 로거 자료(온도·습도·배지온도·배지습도·PPFD·일사량·EC)를
+환경 로거 자료(온도·습도·배지온도·배지습도·PPFD·일사량·EC 등)를
 **생육조사 간격(7일·10일)에 맞춰 시차 매칭**하고, **결측·센서오류를 자동 감시**하며,
 **센서 정기 검증 이력을 관리**하는 파이프라인.
+
+**로거 기종을 가리지 않는다.** METER ZL6 뿐 아니라 국산 로거·자체 기록 파일도
+**시간(또는 날짜+시간) 열만 있으면** 그대로 처리된다 — 기록 간격(1·5·10·15·30·60분),
+구분자·인코딩(CP949 포함), 헤더 위치, 변수명 표기(`SoilTemp`/`배지 온도`/`Soil Temperature`)를
+자동 인식하고, 표준 변수가 아닌 열(수온·pH·풍속 등)도 버리지 않고 집계·감시한다.
+
+📖 **대시보드 사용법(설치·화면 설명)**: [`docs/dashboard_guide.md`](docs/dashboard_guide.md)
 
 ```
 로거 파일(.xlsx/.csv)
@@ -29,7 +36,7 @@ pip install -r requirements.txt
 
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
-python tests/test_pipeline.py           # 16/16 통과
+python tests/test_pipeline.py           # 22/22 통과
 
 # 1) 전처리 — 환경 10분 → 생육 구간 매칭
 python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
@@ -50,7 +57,7 @@ streamlit run app/streamlit_app.py
 
 수작업으로 하던 "10분 자료를 조사간격에 맞춰 평균" 을 2단계 집계로 코드화했다.
 
-- **Step 1 (10분 → 일별)**: 온도=평균/최저/최고/일교차, PPFD=**일적산 DLI**,
+- **Step 1 (원자료 → 일별)**: 기록 간격은 자료에서 자동 추정(1·5·10·15·30·60분): 온도=평균/최저/최고/일교차, PPFD=**일적산 DLI**,
   VPD=10분에서 계산 후 평균, GDD=max(일평균T−기준온도,0), 관측 완전성(n/144) 산출
 - **Step 2 (일별 → 구간)**: 각 조사일에 **직전 조사일 다음날~당일** 구간을 매칭.
   평균형은 구간 평균, 적산형(DLI·GDD·일사량)은 **합계와 일평균 둘 다** + 시험 시작부터 누적
@@ -118,8 +125,14 @@ R 버전(통계·그래프를 R 에서 이어갈 때): [`R/env_growth_match.R`](
 ## 4. 대시보드 (Streamlit)
 
 ```bash
-streamlit run app/streamlit_app.py
+pip install -r requirements.txt
+streamlit run app/streamlit_app.py     # 터미널에 뜨는 http://localhost:8501 접속
 ```
+
+왼쪽 사이드바에 로거 파일을 넣으면(업로드 또는 서버 경로) 아래 4개 탭이 채워진다.
+사이드바의 **🔍 자동 인식 결과 / 수정**에서 시간 열·기록 간격·인식 변수를 확인하고,
+틀렸을 때만 열의 의미를 직접 지정한다. 화면별 상세 안내는
+[`docs/dashboard_guide.md`](docs/dashboard_guide.md) 및 각 탭의 **❓ 이 화면 보는 법**.
 
 | 탭 | 기능 |
 |---|---|
@@ -165,7 +178,8 @@ scripts/run_preprocess.py      전처리 CLI
 scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
-tests/                         합성 자료 생성기 + 검증 테스트 16종
+tests/                         합성 자료 생성기 + 검증 테스트 22종
+docs/dashboard_guide.md        대시보드 사용법(설치·화면별 안내)
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식
 ```

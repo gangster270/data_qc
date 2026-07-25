@@ -82,7 +82,7 @@ def main() -> int:
     lag_days = args.lag_days if args.lag_days is not None else int(pcfg.get("lag_days", 0))
     window_days = args.window_days if args.window_days is not None else pcfg.get("window_days")
     gdd_base = args.gdd_base if args.gdd_base is not None else float(pcfg.get("gdd_base", 10.0))
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = None                     # 자료에서 자동 추정(설정이 숫자면 그 값)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -95,16 +95,18 @@ def main() -> int:
         print("   ", line)
 
     ts_df, ts_report = io_logger.prepare_timestamp(raw)
-    print(f"    timestamp 열: {ts_report['timestamp_column']} | "
-          f"중복 제거 {ts_report['duplicate_rows']:,}건 | "
-          f"기간 {ts_report['start']} ~ {ts_report['end']}")
+    from src import qc_rules as _qc
+    interval = _qc.resolve_interval(cfg, ts_df)
+    print(f"    시간 열: {ts_report['timestamp_column']} | 기록 간격 {interval:g}분(자동 인식) | "
+          f"중복 제거 {ts_report['duplicate_rows']:,}건")
+    print(f"    기간 {ts_report['start']} ~ {ts_report['end']}")
 
     std, map_report = io_logger.standardize(ts_df, replicate=args.replicate)
     print("    표준화된 변수:", ", ".join(c for c in std.columns if c != "timestamp"))
 
     grid, gap_report = io_logger.reindex_full_grid(std, interval_minutes=interval)
     n_missing = int((grid["qc_status"] == "missing_timestamp_inserted").sum())
-    print(f"    10분 격자 정합: 전체 {len(grid):,}행 중 결측 timestamp {n_missing:,}건 "
+    print(f"    {interval:g}분 격자 정합: 전체 {len(grid):,}행 중 결측 timestamp {n_missing:,}건 "
           f"({n_missing / max(len(grid), 1):.1%})")
 
     # --- 2) 범위 이탈값 결측 처리 + 일별 요약 ----------------------------

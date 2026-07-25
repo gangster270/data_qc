@@ -20,7 +20,7 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "qc_config.yaml"
 
 # yaml 이 없거나 키가 누락됐을 때 사용하는 기본값 (qc_config.yaml 과 동일 구조)
 DEFAULT_CONFIG = {
-    "site": {"name": "site", "timezone": "Asia/Seoul", "interval_minutes": 10},
+    "site": {"name": "site", "timezone": "Asia/Seoul", "interval_minutes": "auto"},
     "preprocess": {
         "gdd_base": 10.0,
         "daily_min_completeness": 0.90,
@@ -31,15 +31,15 @@ DEFAULT_CONFIG = {
         "window_days": None,
     },
     "sensors": {
-        "temp": {"label": "온도", "unit": "℃", "min": -40, "max": 80, "flat_n": 36, "spike": 5.0},
-        "rh": {"label": "습도", "unit": "%", "min": 0, "max": 100, "flat_n": 36, "spike": 30.0},
-        "soil_temp": {"label": "배지온도", "unit": "℃", "min": -40, "max": 60, "flat_n": 72, "spike": 4.0},
+        "temp": {"label": "온도", "unit": "℃", "min": -40, "max": 80, "flat_minutes": 360, "spike": 5.0},
+        "rh": {"label": "습도", "unit": "%", "min": 0, "max": 100, "flat_minutes": 360, "spike": 30.0},
+        "soil_temp": {"label": "배지온도", "unit": "℃", "min": -40, "max": 60, "flat_minutes": 720, "spike": 4.0},
         # METER TEROS 는 '% Water Content'(체적수분 ×100) — m³/m³ 가 아니라 % 단위
-        "vwc": {"label": "배지습도", "unit": "%", "min": 0.0, "max": 75.0, "flat_n": 72, "spike": 15.0},
-        "ppfd": {"label": "PPFD", "unit": "µmol m-2 s-1", "min": 0, "max": 2500, "flat_n": 18, "spike": 1500},
-        "solar": {"label": "일사량", "unit": "W/m²", "min": 0, "max": 1400, "flat_n": 18, "spike": 800},
-        "ec": {"label": "EC", "unit": "mS/cm", "min": 0.0, "max": 20.0, "flat_n": 72, "spike": 3.0},
-        "co2": {"label": "CO2", "unit": "ppm", "min": 250, "max": 3000, "flat_n": 36, "spike": 500},
+        "vwc": {"label": "배지습도", "unit": "%", "min": 0.0, "max": 75.0, "flat_minutes": 720, "spike": 15.0},
+        "ppfd": {"label": "PPFD", "unit": "µmol m-2 s-1", "min": 0, "max": 2500, "flat_minutes": 180, "spike": 1500},
+        "solar": {"label": "일사량", "unit": "W/m²", "min": 0, "max": 1400, "flat_minutes": 180, "spike": 800},
+        "ec": {"label": "EC", "unit": "mS/cm", "min": 0.0, "max": 20.0, "flat_minutes": 720, "spike": 3.0},
+        "co2": {"label": "CO2", "unit": "ppm", "min": 250, "max": 3000, "flat_minutes": 360, "spike": 500},
     },
     "qc": {
         "gap_warn_minutes": 60,

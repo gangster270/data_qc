@@ -44,13 +44,14 @@ def load_standardized(paths: list[str], cfg: dict, replicate: str = "first"):
     raw, log = io_logger.load_env_files(paths)
     ts_df, ts_report = io_logger.prepare_timestamp(raw)
     std, map_report = io_logger.standardize(ts_df, replicate=replicate)
-    interval = int(cfg["site"]["interval_minutes"])
+    interval = qc_rules.resolve_interval(cfg, ts_df)      # 설정이 auto 면 자료에서 추정
     grid, gap_report = io_logger.reindex_full_grid(std, interval_minutes=interval)
     context = {
         "start": str(ts_report["start"]),
         "end": str(ts_report["end"]),
         "n_rows": int(ts_report["n_rows"]),
         "n_missing_ts": int((grid["qc_status"] == "missing_timestamp_inserted").sum()),
+        "interval_minutes": interval,
         "n_files": len(paths),
         "duplicates": int(ts_report["duplicate_rows"]),
     }
@@ -87,6 +88,8 @@ def main() -> int:
 
     summary = {
         **qc_rules.summarize(alerts),
+        "interval_minutes": context["interval_minutes"],
+        "variables": sorted(qc_rules.value_columns(grid)),
         "sent": result["n_sent"],
         "report": result.get("report_path"),
         "period": f"{context['start']} ~ {context['end']}",

@@ -83,13 +83,17 @@ def mask_out_of_range(df10: pd.DataFrame, sensors: dict) -> tuple[pd.DataFrame, 
 # ---------------------------------------------------------------------
 def to_daily(
     df10: pd.DataFrame,
-    interval_minutes: int = 10,
+    interval_minutes: float | None = None,
     gdd_base: float = 10.0,
     photoperiod_ppfd_threshold: float = 10.0,
     daytime_hours: tuple[int, int] = (9, 15),
     min_completeness: float = 0.90,
+    include_replicates: bool = False,
 ) -> pd.DataFrame:
-    """10분 환경자료를 일별로 요약한다.
+    """환경자료(임의 기록간격)를 일별로 요약한다.
+
+    interval_minutes 를 주지 않으면 자료에서 자동 추정한다(1·5·10·15·30·60분 등).
+    표준 변수가 아닌 열(CO2·풍속·수온 등)도 평균/최저/최고로 함께 요약한다.
 
     산출 열
       date, n_records, expected_records, completeness, is_complete
@@ -102,12 +106,22 @@ def to_daily(
     if df10.empty:
         return pd.DataFrame()
 
+    if interval_minutes is None:
+        from .io_logger import detect_interval_minutes
+        interval_minutes = detect_interval_minutes(df10["timestamp"])
+
     df = add_derived(df10)
     df = df.copy()
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
     df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-    expected = int(24 * 60 / interval_minutes)          # 10분 → 144
+    expected = max(int(round(24 * 60 / interval_minutes)), 1)   # 10분 → 144, 1시간 → 24
     seconds = interval_minutes * 60
+
+    # 표준 변수가 아닌 수치 열(CO2·풍속·수온·pH 등)도 요약 대상에 넣는다
+    known = set(MEAN_VARS) | {"ppfd", "solar", "timestamp", "date", "hour", "qc_status", "_source_file"}
+    extra_vars = [c for c in df.columns
+                  if c not in known and pd.api.types.is_numeric_dtype(df[c])
+                  and (include_replicates or "__rep" not in c)]
 
     recs = []
     for date, g in df.groupby("date", sort=True):
@@ -177,8 +191,16 @@ def to_daily(
                 row["solar_MJ"] = float(s.sum() * seconds / 1e6)
                 row["solar_max"] = float(s.max())
 
+        # --- 표준 변수가 아닌 열: 평균/최저/최고 ---------------------------
+        for var in extra_vars:
+            s = g[var].dropna()
+            if len(s):
+                row[f"{var}_mean"] = float(s.mean())
+                row[f"{var}_min"] = float(s.min())
+                row[f"{var}_max"] = float(s.max())
+
         # --- 변수별 결측률 -------------------------------------------------
-        for var in ("temp", "rh", "soil_temp", "vwc", "ppfd", "solar", "ec", "co2"):
+        for var in list(("temp", "rh", "soil_temp", "vwc", "ppfd", "solar", "ec", "co2")) + extra_vars:
             if var in g:
                 row[f"{var}_missing_ratio"] = round(1 - g[var].notna().sum() / expected, 4)
 
@@ -287,40 +309,38 @@ def aggregate_intervals(daily: pd.DataFrame, intervals: pd.DataFrame,
             recs.append(row)
             continue
 
-        # --- 평균 성격: 구간 평균 ---------------------------------------
-        for var in ("temp", "soil_temp", "vwc"):
-            if f"{var}_mean" in sub:
-                row[f"{var}_mean"] = float(sub[f"{var}_mean"].mean())
-            if f"{var}_min" in sub:
-                row[f"{var}_min"] = float(sub[f"{var}_min"].min())      # 구간 중 최저
-                row[f"{var}_min_mean"] = float(sub[f"{var}_min"].mean())  # 일최저의 평균
-            if f"{var}_max" in sub:
-                row[f"{var}_max"] = float(sub[f"{var}_max"].max())
-                row[f"{var}_max_mean"] = float(sub[f"{var}_max"].mean())
-        if "temp_amp" in sub:
-            row["temp_amp_mean"] = float(sub["temp_amp"].mean())        # 평균 일교차
-        for col in ("rh_mean", "rh_min", "vpd_mean", "vpd_day", "ec_mean", "co2_mean",
-                    "ppfd_day_mean", "photoperiod_h"):
-            if col in sub:
-                row[col] = float(sub[col].mean())
+        skip = {"date", "n_records", "expected_records", "completeness", "is_complete"}
+        for col in sub.columns:
+            if col in skip or not pd.api.types.is_numeric_dtype(sub[col]):
+                continue
 
-        # --- 적산 성격: 합계 + 일평균 -----------------------------------
-        for col, out_sum, out_mean in (("dli", "dli_sum", "dli_mean"),
-                                       ("gdd", "gdd_sum", "gdd_mean"),
-                                       ("solar_MJ", "solar_MJ_sum", "solar_MJ_mean")):
-            if col in sub:
-                row[out_sum] = float(sub[col].sum())
-                row[out_mean] = float(sub[col].mean())
-
-        # --- 결측률(구간 평균) -------------------------------------------
-        for var in ("temp", "rh", "soil_temp", "vwc", "ppfd", "solar"):
-            c = f"{var}_missing_ratio"
-            if c in sub:
-                row[c] = round(float(sub[c].mean()), 4)
+            # --- 적산 성격: 합계 + 일평균 (DLI·GDD·일사 적산) -------------
+            if col in SUM_VARS:
+                row[f"{col}_sum"] = float(sub[col].sum())
+                row[f"{col}_mean"] = float(sub[col].mean())
+            # --- 결측률: 구간 평균 ---------------------------------------
+            elif col.endswith("_missing_ratio"):
+                row[col] = round(float(sub[col].mean()), 4)
+            # --- 일최저: 구간 최저 + 일최저의 평균 ------------------------
+            elif col.endswith("_min"):
+                row[col] = float(sub[col].min())
+                row[f"{col}_mean"] = float(sub[col].mean())
+            # --- 일최고: 구간 최고 + 일최고의 평균 ------------------------
+            elif col.endswith("_max"):
+                row[col] = float(sub[col].max())
+                row[f"{col}_mean"] = float(sub[col].mean())
+            # --- 그 밖(평균 성격): 구간 평균 -------------------------------
+            else:
+                name = col if col.endswith("_mean") or col in ("photoperiod_h", "vpd_day") \
+                    else f"{col}_mean"
+                row[name] = float(sub[col].mean())
 
         recs.append(row)
 
     out = pd.DataFrame(recs).sort_values("interval_id").reset_index(drop=True)
+
+    if "temp_amp_mean" not in out.columns and "temp_amp" in out.columns:
+        out = out.rename(columns={"temp_amp": "temp_amp_mean"})      # 평균 일교차
 
     # --- 시험 시작부터의 누적값 ------------------------------------------
     for col, cum in (("dli_sum", "cum_dli"), ("gdd_sum", "cum_gdd"), ("solar_MJ_sum", "cum_solar_MJ")):

@@ -7,7 +7,10 @@
 site:
   name: "시설재배 실증포장"
   timezone: "Asia/Seoul"
-  interval_minutes: 10          # 로거 기록 간격(분). 10분 → 하루 144 레코드
+  # 기록 간격(분). "auto" 면 자료의 timestamp 에서 자동 추정한다.
+  #   1·5·10·15·30·60분 어느 로거든 그대로 처리되며, DLI·완전성·고착 판정에 반영된다.
+  #   특정 값으로 고정하려면 숫자를 적는다(예: 10).
+  interval_minutes: auto
 
 # ---------------------------------------------------------------------
 # 1. 전처리(환경 → 생육 구간 집계) 규칙
@@ -23,23 +26,26 @@ preprocess:
 
 # ---------------------------------------------------------------------
 # 2. 센서 물리 범위 (out-of-range 판정)
-#    min/max: 이 범위를 벗어나면 오류값으로 간주
-#    flat_n : 같은 값이 N회 연속이면 고착(flatline) 의심
-#    spike  : 10분 간 변화량이 이 값을 넘으면 급변(spike) 의심
+#    min/max      : 이 범위를 벗어나면 오류값으로 간주
+#    flat_minutes : 같은 값이 이 시간(분)만큼 연속되면 고착(flatline) 의심
+#                   (횟수가 아니라 시간 기준 → 기록 간격이 달라도 기준이 유지된다)
+#    spike        : 10분당 변화량 기준. 다른 간격 자료에는 자동 환산된다.
+#    ※ 여기 없는 변수(CO2·풍속·수온·pH 등)도 자동 보존되며, 범위 판정만 생략하고
+#      결측·고착 규칙은 동일하게 적용된다. 임계값을 주고 싶으면 여기에 추가한다.
 # ---------------------------------------------------------------------
 #    ※ 범위는 '센서 측정사양' 기준으로 넓게 잡는다. 작물 기준으로 좁게 잡으면
 #      실제 고온사고(예: 환기 실패로 70℃) 같은 진짜 사건이 오류로 지워진다.
 #      작물 위험 수준은 별도 규칙(heat_event)으로 경보한다.
 sensors:
-  temp:        {label: "온도",     unit: "℃",             min: -40,  max: 80,    flat_n: 36, spike: 5.0}
-  rh:          {label: "습도",     unit: "%",              min: 0,    max: 100,   flat_n: 36, spike: 30.0}
-  soil_temp:   {label: "배지온도", unit: "℃",             min: -40,  max: 60,    flat_n: 72, spike: 4.0}
+  temp:        {label: "온도",     unit: "℃",             min: -40,  max: 80,    flat_minutes: 360, spike: 5.0}
+  rh:          {label: "습도",     unit: "%",              min: 0,    max: 100,   flat_minutes: 360, spike: 30.0}
+  soil_temp:   {label: "배지온도", unit: "℃",             min: -40,  max: 60,    flat_minutes: 720, spike: 4.0}
   # METER TEROS 는 '% Water Content'(체적수분 ×100)로 내보낸다. m³/m³ 가 아니라 % 단위.
-  vwc:         {label: "배지습도", unit: "%",              min: 0.0,  max: 75.0,  flat_n: 72, spike: 15.0}
-  ppfd:        {label: "PPFD",     unit: "µmol m-2 s-1",   min: 0,    max: 2500,  flat_n: 18, spike: 1500}
-  solar:       {label: "일사량",   unit: "W/m²",           min: 0,    max: 1400,  flat_n: 18, spike: 800}
-  ec:          {label: "EC",       unit: "mS/cm",          min: 0.0,  max: 20.0,  flat_n: 72, spike: 3.0}
-  co2:         {label: "CO2",      unit: "ppm",            min: 250,  max: 3000,  flat_n: 36, spike: 500}
+  vwc:         {label: "배지습도", unit: "%",              min: 0.0,  max: 75.0,  flat_minutes: 720, spike: 15.0}
+  ppfd:        {label: "PPFD",     unit: "µmol m-2 s-1",   min: 0,    max: 2500,  flat_minutes: 180, spike: 1500}
+  solar:       {label: "일사량",   unit: "W/m²",           min: 0,    max: 1400,  flat_minutes: 180, spike: 800}
+  ec:          {label: "EC",       unit: "mS/cm",          min: 0.0,  max: 20.0,  flat_minutes: 720, spike: 3.0}
+  co2:         {label: "CO2",      unit: "ppm",            min: 250,  max: 3000,  flat_minutes: 360, spike: 500}
 
 # ---------------------------------------------------------------------
 # 3. QC 규칙별 임계값 / 심각도

@@ -213,6 +213,55 @@ def to_daily(
 # ---------------------------------------------------------------------
 # Step 2. 생육 조사일 → 구간 정의 (시차 매칭의 핵심)
 # ---------------------------------------------------------------------
+def parse_survey_dates(dates=None, start=None, end=None, interval=None, count=None) -> list[pd.Timestamp]:
+    """생육 조사일 목록을 만든다 — **사용자가 기준을 직접 정할 때 쓰는 진입점**.
+
+    세 가지 방식 중 하나를 쓴다.
+      (a) 조사일 직접 나열 : dates="2026-04-01, 2026-04-11, 2026-04-21" (리스트도 가능)
+      (b) 시작일 + 간격 + 횟수 : start="2026-04-01", interval=10, count=6
+      (c) 시작일 + 간격 + 종료일 : start="2026-04-01", interval=7, end="2026-06-08"
+
+    (a) 는 실제 조사일이 불규칙할 때(현장 사정으로 하루씩 밀린 경우) 그대로 반영된다.
+    반환: 오름차순 정렬된 중복 없는 Timestamp 목록.
+    """
+    out: list[pd.Timestamp] = []
+
+    if dates is not None and (not isinstance(dates, str) or dates.strip()):
+        items = dates.replace("\n", ",").split(",") if isinstance(dates, str) else list(dates)
+        for d in items:
+            d = str(d).strip()
+            if not d:
+                continue
+            ts = pd.to_datetime(d, errors="coerce")
+            if pd.isna(ts):
+                raise ValueError(f"조사일을 해석할 수 없습니다: '{d}' (예: 2026-04-01)")
+            out.append(pd.Timestamp(ts).normalize())
+
+    elif start is not None and interval:
+        s = pd.to_datetime(start, errors="coerce")
+        if pd.isna(s):
+            raise ValueError(f"시작일을 해석할 수 없습니다: '{start}'")
+        step = int(interval)
+        if step <= 0:
+            raise ValueError("조사 간격은 1일 이상이어야 합니다.")
+        if count:
+            out = [pd.Timestamp(s).normalize() + pd.Timedelta(days=step * i) for i in range(int(count))]
+        elif end is not None:
+            e = pd.to_datetime(end, errors="coerce")
+            if pd.isna(e):
+                raise ValueError(f"종료일을 해석할 수 없습니다: '{end}'")
+            cur, e = pd.Timestamp(s).normalize(), pd.Timestamp(e).normalize()
+            while cur <= e:
+                out.append(cur)
+                cur = cur + pd.Timedelta(days=step)
+        else:
+            raise ValueError("시작일·간격만으로는 부족합니다. 횟수(count) 또는 종료일(end)을 지정하세요.")
+    else:
+        raise ValueError("조사일을 정하려면 '조사일 목록' 또는 '시작일+간격+(횟수|종료일)'이 필요합니다.")
+
+    return sorted(set(out))
+
+
 def detect_cadence(dates: pd.Series) -> int:
     """조사일 간격(7 또는 10일 등)을 데이터에서 자동 추정한다(최빈 간격)."""
     d = pd.to_datetime(pd.Series(sorted(pd.unique(dates))))

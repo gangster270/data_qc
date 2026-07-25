@@ -11,14 +11,18 @@ data_qc 저장소에서 오늘의 환경데이터 QC 점검을 수행해줘.
 
 ```bash
 cd <저장소경로>
-python scripts/run_monitor.py --env "<자료경로>/*.xlsx" --lookback 7 --json
+# 1) 새로 내려받은 파일을 통합 아카이브에 반영(없으면 그대로 통과)
+python scripts/build_archive.py --env "<자료경로>/**/*.xlsx" "<자료경로>/**/*.csv" \
+       --out outputs/archive
+# 2) 아카이브 전체를 로거별로 점검
+python scripts/run_monitor.py --archive outputs/archive --by-logger --lookback 7 --json
 ```
 
 종료코드: 0=정상, 1=WARN 있음, 2=CRITICAL 있음.
 
 ## 2. 읽을 것
 
-- 위 명령의 JSON 요약(등급별 건수, 규칙별 건수, 결측 timestamp 수)
+- 위 명령의 JSON 요약(등급별 건수, 규칙별 건수, 로거별 건수 `by_logger`, 결측 timestamp 수)
 - `outputs/reports/qc_report_<오늘날짜>.md` (센서 상태표 + 신규 알림)
 - **어제 리포트** `outputs/reports/qc_report_<어제날짜>.md` — 비교용
 

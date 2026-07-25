@@ -412,6 +412,106 @@ def test_flat_and_spike_scale_with_interval():
     print("✓ 간격에 따른 고착·급변 기준 환산")
 
 
+# ---------------------------------------------------------------------
+# 조사일 기준 직접 지정 · 통합 아카이브
+# ---------------------------------------------------------------------
+def test_parse_survey_dates():
+    """조사일을 사용자가 세 가지 방식으로 지정할 수 있다."""
+    # (a) 직접 나열 — 불규칙해도 그대로
+    d = preprocess.parse_survey_dates(dates="2026-04-01, 2026-04-11,2026-04-18")
+    assert [x.strftime("%m-%d") for x in d] == ["04-01", "04-11", "04-18"]
+    # 리스트·공백·중복·역순도 정리된다
+    d2 = preprocess.parse_survey_dates(dates=["2026-04-11", "2026-04-01", "2026-04-11"])
+    assert len(d2) == 2 and d2[0] < d2[1]
+
+    # (b) 시작일 + 간격 + 횟수
+    d3 = preprocess.parse_survey_dates(start="2026-04-01", interval=10, count=4)
+    assert len(d3) == 4 and (d3[1] - d3[0]).days == 10
+    # (c) 시작일 + 간격 + 종료일
+    d4 = preprocess.parse_survey_dates(start="2026-04-01", interval=7, end="2026-04-29")
+    assert [x.strftime("%m-%d") for x in d4] == ["04-01", "04-08", "04-15", "04-22", "04-29"]
+
+    for bad in (dict(), dict(start="2026-04-01"), dict(dates="어제")):
+        try:
+            preprocess.parse_survey_dates(**bad)
+            raise AssertionError(f"오류가 나야 함: {bad}")
+        except ValueError:
+            pass
+
+    # 지정한 조사일이 그대로 구간이 된다
+    iv = preprocess.build_intervals(pd.Series(d), first_start="2026-03-25")
+    assert iv["days_expected"].tolist() == [8, 10, 7]
+    print("✓ 조사일 사용자 지정(직접·시작일+간격·종료일)")
+
+
+def _write_logger_file(path: Path, start: str, periods: int, freq: str, temp0=20.0):
+    ts = pd.date_range(start, periods=periods, freq=freq)
+    pd.DataFrame({
+        "Timestamp": ts,
+        " °C Air Temperature": np.linspace(temp0, temp0 + 5, periods).round(2),
+        "% Relative Humidity": np.linspace(60, 70, periods).round(1),
+    }).to_excel(path, index=False)
+
+
+def test_archive_build_merge_and_update(tmp_path=None):
+    """여러 로거·기간의 파일을 날짜순으로 모으고, 새 파일은 이어붙인다."""
+    import tempfile
+    from src import archive
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _write_logger_file(tmp / "logA_1.xlsx", "2026-05-01", 144, "10min")
+        _write_logger_file(tmp / "logB_1.xlsx", "2026-05-01", 24, "1h", temp0=15.0)
+        out = tmp / "archive"
+
+        res = archive.build_archive([str(tmp / "logA_1.xlsx"), str(tmp / "logB_1.xlsx")],
+                                    CFG, out, update=False)
+        master = res["master"]
+        assert set(master["logger"]) == {"logA", "logB"}
+        assert len(master) == 144 + 24
+        # 로거·시각 순 정렬
+        assert master.sort_values(["logger", "timestamp"]).equals(master)
+        assert {"temp", "rh"} <= set(master.columns)
+        # 로거마다 기록 간격이 달라도 각각 맞게 격자 정합된다
+        assert res["summary"].set_index("로거").loc["logB", "기록간격(분)"] == 60
+
+        # 같은 파일을 다시 넣어도 행이 늘지 않는다(중복 병합)
+        res2 = archive.build_archive([str(tmp / "logA_1.xlsx")], CFG, out, update=True)
+        assert len(res2["master"]) == len(master)
+
+        # 이어지는 기간의 새 파일은 추가된다
+        _write_logger_file(tmp / "logA_2.xlsx", "2026-05-02", 144, "10min")
+        res3 = archive.build_archive([str(tmp / "logA_2.xlsx")], CFG, out, update=True)
+        assert len(res3["master"]) == len(master) + 144
+        assert res3["master"]["timestamp"].max().strftime("%m-%d") == "05-02"
+
+        # 저장·재로딩이 되고, 로거별 순회가 동작한다
+        reloaded = archive.load_master(out)
+        assert len(reloaded) == len(res3["master"])
+        ids = [lid for lid, _ in archive.iter_loggers(reloaded)]
+        assert ids == ["logA", "logB"]
+    print("✓ 통합 아카이브 생성·중복병합·증분 업데이트")
+
+
+def test_archive_mixed_intervals_daily():
+    """아카이브에 간격이 다른 로거가 섞여 있어도 각각 올바르게 일별 집계된다."""
+    import tempfile
+    from src import archive
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        _write_logger_file(tmp / "tenmin_1.xlsx", "2026-05-01", 144 * 2, "10min")
+        _write_logger_file(tmp / "hourly_1.xlsx", "2026-05-01", 24 * 2, "1h")
+        res = archive.build_archive([str(tmp / "tenmin_1.xlsx"), str(tmp / "hourly_1.xlsx")],
+                                    CFG, tmp / "arc", update=False)
+        expected = {}
+        for logger_id, df in archive.iter_loggers(res["master"]):
+            daily = preprocess.to_daily(df)                    # 간격 자동 추정
+            expected[logger_id] = int(daily["expected_records"].iloc[0])
+        assert expected == {"tenmin": 144, "hourly": 24}
+    print("✓ 간격이 다른 로거 혼재 아카이브")
+
+
 def test_judge_tolerance():
     assert sensor_check.judge("temp", 0.3, 20.0, CFG)[0] == "pass"
     assert sensor_check.judge("temp", 0.8, 20.0, CFG)[0] == "fail"

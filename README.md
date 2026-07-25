@@ -12,7 +12,11 @@
 📖 **대시보드 사용법(설치·화면 설명)**: [`docs/dashboard_guide.md`](docs/dashboard_guide.md)
 
 ```
-로거 파일(.xlsx/.csv)
+로거 파일(.xlsx/.csv, 기종·간격 무관, 여러 대·여러 번)
+   │
+   ├─▶ [통합 아카이브] 날짜순 정렬 · 변수 표준화 · 중복 정리 · 증분 업데이트
+   │                  scripts/build_archive.py · src/archive.py
+   │                  → env_master.csv (원자료) / env_master_clean.csv (QC 적용)
    │
    ├─▶ [전처리]  10분 → 일별 → 생육 구간(시차 매칭) → merged_env_growth.csv
    │              scripts/run_preprocess.py · src/preprocess.py · R/env_growth_match.R
@@ -36,17 +40,21 @@ pip install -r requirements.txt
 
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
-python tests/test_pipeline.py           # 22/22 통과
+python tests/test_pipeline.py           # 25/25 통과
 
-# 1) 전처리 — 환경 10분 → 생육 구간 매칭
+# 1) 통합 — 보유한 모든 환경데이터를 하나로 (새 파일 받으면 다시 실행만)
+python scripts/build_archive.py --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive
+
+# 1-0) 전처리 — 환경 10분 → 생육 구간 매칭
 python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
        --first-start 2026-04-01 --out outputs/
 
-# 1-1) 로거 여러 대를 한 번에 (처리구별 집계 + 통합 파일)
-python scripts/run_all_loggers.py --env "data/*.xlsx" --by-treatment --out outputs/all
+# 1-1) 조사일을 직접 정해 시차 매칭 (생육 파일 없이도 가능)
+python scripts/run_all_loggers.py --archive outputs/archive --by-treatment \
+       --survey-start 2026-04-01 --survey-interval 10 --survey-count 6 --out outputs/all
 
-# 2) 모니터링 — 최근 7일 결측·센서오류 점검 + 알림
-python scripts/run_monitor.py --env "data/*.xlsx" --lookback 7
+# 2) 모니터링 — 아카이브 전체를 로거별로 점검 + 알림
+python scripts/run_monitor.py --archive outputs/archive --by-logger --lookback 7
 
 # 3) 대시보드
 streamlit run app/streamlit_app.py
@@ -64,6 +72,8 @@ streamlit run app/streamlit_app.py
   VPD=10분에서 계산 후 평균, GDD=max(일평균T−기준온도,0), 관측 완전성(n/144) 산출
 - **Step 2 (일별 → 구간)**: 각 조사일에 **직전 조사일 다음날~당일** 구간을 매칭.
   평균형은 구간 평균, 적산형(DLI·GDD·일사량)은 **합계와 일평균 둘 다** + 시험 시작부터 누적
+- **조사일 기준을 직접 지정**: 생육 파일이 없어도 `--survey-start/--survey-interval/--survey-count`
+  또는 `--survey-dates "2026-04-01,2026-04-11,…"` 로 원하는 조사일을 넣으면 그 기준으로 매칭
 - **시차(lag)**: `--lag-days 3` → 구간 전체를 3일 앞당겨 매칭(지연 반응 검토)
 - **고정창**: `--window-days 10` → 조사일 직전 10일 고정
 - 조사간격 7·10일은 **자동 추정**, 불규칙 간격도 그대로 처리
@@ -177,12 +187,14 @@ src/qc_rules.py                QC 규칙 13종 + 센서 상태표
 src/alerts.py                  중복 억제, 리포트, 채널 발송
 src/sensor_check.py            검증 로그·기한·상호비교·드리프트
 src/sensor_map.py              센서↔처리구 매핑, 처리구 분리
-scripts/run_preprocess.py      전처리 CLI
+src/archive.py                 전체 환경데이터 통합·정렬·증분 업데이트
+scripts/build_archive.py       전체 환경데이터 통합 아카이브 생성/갱신
+scripts/run_preprocess.py      전처리 CLI(조사일 직접 지정 가능)
 scripts/run_all_loggers.py     로거 일괄 전처리 + 통합 산출물
 scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
-tests/                         합성 자료 생성기 + 검증 테스트 22종
+tests/                         합성 자료 생성기 + 검증 테스트 25종
 docs/dashboard_guide.md        대시보드 사용법(설치·화면별 안내)
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식

@@ -48,9 +48,11 @@ Claude 가 `create_trigger` 로 등록한다. 등록 후 `list_triggers` 로 확
 ### 방법 B — 로컬 cron (Cowork 없이 규칙 엔진만)
 
 ```bash
-# 매일 08:00 실행, 종료코드로 심각도 구분(0=정상, 1=WARN, 2=CRITICAL)
-0 8 * * * cd /path/to/data_qc && /usr/bin/python3 scripts/run_monitor.py \
-    --env "data/*.xlsx" --lookback 7 >> outputs/monitor.log 2>&1
+# 매일 07:50 아카이브 갱신 → 08:00 점검 (종료코드 0=정상, 1=WARN, 2=CRITICAL)
+50 7 * * * cd /path/to/data_qc && /usr/bin/python3 scripts/build_archive.py \
+    --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive >> outputs/archive.log 2>&1
+ 0 8 * * * cd /path/to/data_qc && /usr/bin/python3 scripts/run_monitor.py \
+    --archive outputs/archive --by-logger --lookback 7 >> outputs/monitor.log 2>&1
 ```
 
 ### 방법 C — GitHub Actions (자료가 저장소/클라우드에 있을 때)
@@ -85,7 +87,9 @@ jobs:
 
 전문은 `cowork/daily_qc_prompt.md`. 요지는 다음과 같다.
 
-1. `python scripts/run_monitor.py --env "<자료경로>" --lookback 7 --json` 실행
+1. 아카이브 갱신 후 점검:
+   `python scripts/build_archive.py --env "<자료경로>/**/*.xlsx" --out outputs/archive`
+   `python scripts/run_monitor.py --archive outputs/archive --by-logger --lookback 7 --json`
 2. 종료코드·JSON 요약·`outputs/reports/qc_report_*.md` 를 읽는다
 3. **어제 리포트와 비교**해 신규/지속/해소 이상을 구분한다
 4. CRITICAL 이 있으면 원인 후보와 조치 순서를 3줄 이내로 정리해 사람에게 알린다

@@ -24,7 +24,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import alerts as alert_mod          # noqa: E402
-from src import io_logger, preprocess, qc_rules, sensor_check, sensor_map   # noqa: E402
+from src import archive, io_logger, preprocess, qc_rules, sensor_check, sensor_map   # noqa: E402
 from src.config import PROJECT_ROOT, load_config, resolve_path  # noqa: E402
 
 st.set_page_config(page_title="환경데이터 QC 대시보드", page_icon="🌱", layout="wide")
@@ -62,6 +62,12 @@ def load_from_paths(paths: tuple[str, ...], _cfg: dict, replicate: str,
     return _process(raw, log, _cfg, replicate, dict(overrides_key))
 
 
+@st.cache_data(show_spinner=False)
+def load_archive_master(arc_dir: str):
+    """통합 아카이브 마스터를 읽는다(캐시)."""
+    return archive.load_master(arc_dir, clean=False)
+
+
 def df_download(df: pd.DataFrame, label: str, filename: str, key: str | None = None):
     st.download_button(label, df.to_csv(index=False).encode("utf-8-sig"),
                        file_name=filename, mime="text/csv", key=key)
@@ -86,7 +92,9 @@ st.sidebar.caption(f"현장: {cfg['site'].get('name', '-')} · "
                    f"기록간격 {cfg['site'].get('interval_minutes', 'auto')}")
 
 st.sidebar.markdown("**① 파일 넣기 → ② 탭에서 확인**")
-source_mode = st.sidebar.radio("데이터 입력", ["파일 업로드", "서버 경로"], horizontal=True)
+source_mode = st.sidebar.radio("데이터 입력", ["파일 업로드", "서버 경로", "통합 아카이브"],
+                              horizontal=True,
+                              help="통합 아카이브 = build_archive.py 로 만든 전체 환경데이터 마스터")
 replicate = st.sidebar.selectbox(
     "중복 센서 처리", ["first", "mean", "keep"], index=0,
     help="같은 변수 센서가 여러 개일 때: first=첫 센서, mean=평균(같은 위치 반복일 때만), keep=모두 보존")
@@ -107,6 +115,29 @@ if source_mode == "파일 업로드":
         with st.spinner("파일 처리 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_bytes(
                 payload, cfg, replicate, overrides_key)
+elif source_mode == "통합 아카이브":
+    arc_dir = st.sidebar.text_input("아카이브 경로", value="outputs/archive",
+                                    help="build_archive.py 의 --out 디렉터리")
+    arc_path = PROJECT_ROOT / arc_dir if not Path(arc_dir).is_absolute() else Path(arc_dir)
+    if (arc_path / archive.MASTER_NAME).exists():
+        master_all = load_archive_master(str(arc_path))
+        loggers_in = sorted(master_all["logger"].unique()) if "logger" in master_all else ["(전체)"]
+        pick_logger = st.sidebar.selectbox("로거", loggers_in)
+        sub = master_all[master_all["logger"] == pick_logger] if "logger" in master_all else master_all
+        sub = sub.drop(columns=[c for c in ("logger",) if c in sub.columns]).dropna(axis=1, how="all")
+        st.session_state["loaded_names"] = [f"{pick_logger}.xlsx"]
+        interval_a = qc_rules.resolve_interval(cfg, sub)
+        grid, gap_report = io_logger.reindex_full_grid(sub.reset_index(drop=True),
+                                                       interval_minutes=interval_a)
+        map_report = pd.DataFrame()
+        ts_report = {"timestamp_column": "timestamp(아카이브)", "duplicate_rows": 0,
+                     "start": sub["timestamp"].min(), "end": sub["timestamp"].max(),
+                     "n_rows": len(sub), "interval_minutes": interval_a}
+        load_log = [f"아카이브 {arc_dir} → 로거 {pick_logger} ({len(sub):,}행)",
+                    f"전체 아카이브: {len(master_all):,}행 / 로거 {master_all['logger'].nunique()}대"]
+    else:
+        st.sidebar.error(f"{arc_dir}/{archive.MASTER_NAME} 이 없습니다. "
+                         f"먼저 build_archive.py 를 실행하세요.")
 else:
     pattern = st.sidebar.text_input("파일 경로/글롭", value="data/*.xlsx")
     if st.sidebar.button("불러오기", type="primary"):
@@ -375,13 +406,96 @@ with tab_pre:
         st.dataframe(daily, use_container_width=True, hide_index=True, height=240)
         df_download(daily, "일별 요약 CSV", "daily_env_summary.csv", "dl_daily")
 
-        st.subheader("② 생육조사 자료 업로드")
-        gfile = st.file_uploader("생육 자료(csv/xlsx) — 조사일 열 필요", type=["csv", "xlsx", "xls"],
-                                 key="growth_up")
-        if gfile is None:
-            st.info("생육 자료를 올리면 조사간격을 자동 추정해 구간 매칭까지 수행합니다. "
-                    "(templates/growth_template.csv 참조)")
+        st.subheader("② 조사일 기준 정하기")
+        mode = st.radio(
+            "조사일을 어떻게 정할까요?",
+            ["시작일 + 간격", "조사일 직접 입력", "생육 파일 업로드"],
+            horizontal=True,
+            help="생육 자료가 아직 없어도 조사일만 정하면 구간 환경을 뽑을 수 있습니다.")
+
+        survey_dates, growth, gfile = None, None, None
+        if mode == "시작일 + 간격":
+            s1, s2, s3, s4 = st.columns(4)
+            default_start = pd.Timestamp(daily["date"].min()).date() if not daily.empty else date.today()
+            sv_start = s1.date_input("조사 시작일", value=default_start, key="sv_start")
+            sv_interval = s2.number_input("조사 간격(일)", 1, 60, 10, key="sv_int")
+            end_mode = s3.selectbox("끝 지정", ["횟수", "종료일"], key="sv_endmode")
+            if end_mode == "횟수":
+                sv_count = s4.number_input("조사 횟수", 2, 60, 6, key="sv_cnt")
+                survey_dates = preprocess.parse_survey_dates(
+                    start=sv_start, interval=int(sv_interval), count=int(sv_count))
+            else:
+                default_end = pd.Timestamp(daily["date"].max()).date() if not daily.empty else date.today()
+                sv_end = s4.date_input("조사 종료일", value=default_end, key="sv_end")
+                survey_dates = preprocess.parse_survey_dates(
+                    start=sv_start, interval=int(sv_interval), end=sv_end)
+            st.caption("조사일: " + ", ".join(d.strftime("%Y-%m-%d") for d in survey_dates))
+
+        elif mode == "조사일 직접 입력":
+            txt = st.text_area(
+                "조사일 목록 (쉼표 또는 줄바꿈으로 구분)",
+                value="", height=90, key="sv_text",
+                placeholder="2026-04-01, 2026-04-11, 2026-04-21")
+            if txt.strip():
+                try:
+                    survey_dates = preprocess.parse_survey_dates(dates=txt)
+                    st.caption(f"조사일 {len(survey_dates)}회 · 간격 "
+                               f"{preprocess.detect_cadence(pd.Series(survey_dates))}일(최빈)")
+                except ValueError as e:
+                    st.error(str(e))
+            else:
+                st.info("조사일을 입력하면 그 날짜 기준으로 구간이 만들어집니다. "
+                        "현장 사정으로 날짜가 밀렸어도 실제 조사일을 그대로 넣으면 됩니다.")
+
         else:
+            gfile = st.file_uploader("생육 자료(csv/xlsx) — 조사일 열 필요",
+                                     type=["csv", "xlsx", "xls"], key="growth_up")
+            if gfile is None:
+                st.info("생육 자료를 올리면 조사간격을 자동 추정해 구간 매칭·병합까지 수행합니다. "
+                        "(templates/growth_template.csv 참조)")
+
+        # --- 조사일만 정해진 경우: 구간 환경 요약까지 ------------------------
+        if survey_dates is not None and len(survey_dates) >= 1:
+            first_start_only = st.date_input(
+                "첫 구간 시작일(정식일 등)",
+                value=pd.Timestamp(daily["date"].min()).date() if not daily.empty else date.today(),
+                key="fs_only")
+            intervals = preprocess.build_intervals(
+                pd.Series(survey_dates), first_start=pd.Timestamp(first_start_only),
+                lag_days=int(lag_days), window_days=int(window_days) if window_days else None)
+            env_interval = (preprocess.aggregate_intervals_by_treatment(daily, intervals, drop_incomplete)
+                            if by_trt else
+                            preprocess.aggregate_intervals(daily, intervals, drop_incomplete))
+
+            st.subheader("③ 구간 정의 (시차 매칭 결과)")
+            st.dataframe(
+                intervals.assign(
+                    조사일=lambda d: d["growth_date"].dt.strftime("%Y-%m-%d"),
+                    환경구간=lambda d: d["start"].dt.strftime("%m-%d") + " ~ " + d["end"].dt.strftime("%m-%d"),
+                )[["interval_id", "조사일", "환경구간", "days_expected", "lag_days"]]
+                .rename(columns={"interval_id": "구간", "days_expected": "일수", "lag_days": "시차(일)"}),
+                use_container_width=True, hide_index=True)
+
+            bad = env_interval[env_interval["quality_flag"] != "정상"] if "quality_flag" in env_interval else pd.DataFrame()
+            if not bad.empty:
+                st.warning(f"품질 주의 구간 {len(bad)}개 — 표의 quality_flag 열 확인")
+
+            st.subheader("④ 구간별 환경 요약")
+            st.dataframe(env_interval, use_container_width=True, hide_index=True, height=260)
+            e1, e2 = st.columns(2)
+            with e1:
+                df_download(env_interval, "구간 요약 CSV", "env_interval_summary.csv", "dl_iv_only")
+            with e2:
+                st.download_button(
+                    "Excel 일괄 다운로드",
+                    excel_bytes({"daily_env_summary": daily, "interval_definition": intervals,
+                                 "env_interval_summary": env_interval, "column_mapping": map_report}),
+                    file_name="preprocess_report.xlsx", key="dl_xl_only",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.caption("생육 측정값을 붙이려면 위에서 '생육 파일 업로드'를 선택하세요. "
+                       "조사일이 같으면 그대로 병합됩니다.")
+
+        if gfile is not None:
             growth = (pd.read_excel(gfile) if Path(gfile.name).suffix.lower() in (".xlsx", ".xls")
                       else pd.read_csv(gfile))
             date_col = st.selectbox("조사일 열", list(growth.columns),

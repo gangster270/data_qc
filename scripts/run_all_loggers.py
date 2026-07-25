@@ -34,7 +34,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import io_logger, preprocess, qc_rules, sensor_map   # noqa: E402
+from src import archive, io_logger, preprocess, qc_rules, sensor_map   # noqa: E402
 from src.config import load_config                            # noqa: E402
 
 
@@ -46,13 +46,22 @@ def group_by_logger(paths: list[str]) -> dict[str, list[str]]:
     return dict(sorted(groups.items()))
 
 
-def process_logger(logger_id: str, files: list[str], cfg: dict, args, smap: dict):
-    """로거 1대를 전처리해 (일별, 구간, 병합, 요약) 을 돌려준다."""
+def process_logger(logger_id: str, files: list[str], cfg: dict, args, smap: dict,
+                   std: pd.DataFrame | None = None):
+    """로거 1대를 전처리해 (일별, 요약, 결측구간, 매핑) 을 돌려준다.
+
+    std 를 주면(아카이브 경로) 파일을 다시 읽지 않고 그 자료를 쓴다.
+    """
     pcfg = cfg["preprocess"]
-    raw, _ = io_logger.load_env_files(files)
-    ts_df, ts_report = io_logger.prepare_timestamp(raw)
-    interval = qc_rules.resolve_interval(cfg, ts_df)
-    std, map_report = io_logger.standardize(ts_df, replicate=args.replicate)
+    map_report = pd.DataFrame()
+    if std is None:
+        raw, _ = io_logger.load_env_files(files)
+        ts_df, ts_report = io_logger.prepare_timestamp(raw)
+        std, map_report = io_logger.standardize(ts_df, replicate=args.replicate)
+    else:
+        ts_report = {"start": std["timestamp"].min(), "end": std["timestamp"].max(),
+                     "n_rows": len(std), "duplicate_rows": 0}
+    interval = qc_rules.resolve_interval(cfg, std)
     grid, gap_report = io_logger.reindex_full_grid(std, interval_minutes=interval)
 
     clean = grid.drop(columns=["qc_status"])
@@ -113,19 +122,34 @@ def main() -> int:
     ap.add_argument("--first-start", default=None)
     ap.add_argument("--keep-out-of-range", action="store_true")
     ap.add_argument("--drop-incomplete-days", action="store_true")
+    ap.add_argument("--archive", help="통합 아카이브 디렉터리(env_master.csv). --env 대신 사용")
+    # --- 조사일 기준: 생육파일 없이도 사용자가 직접 지정 ------------------
+    ap.add_argument("--survey-dates", help='조사일 직접 지정 (예: "2026-04-01,2026-04-11")')
+    ap.add_argument("--survey-start", help="조사 시작일")
+    ap.add_argument("--survey-interval", type=int, help="조사 간격(일)")
+    ap.add_argument("--survey-count", type=int, help="조사 횟수")
+    ap.add_argument("--survey-end", help="조사 종료일(횟수 대신)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
     pcfg = cfg["preprocess"]
     smap = sensor_map.load_sensor_map(args.sensor_map)
 
-    paths: list[str] = []
-    for pattern in args.env:
-        hits = sorted(glob.glob(pattern))
-        paths.extend(hits if hits else [pattern])
-    groups = group_by_logger(paths)
+    archive_frames: dict[str, pd.DataFrame] = {}
+    if args.archive:
+        master = archive.load_master(args.archive, clean=False)
+        archive_frames = {lid: df for lid, df in archive.iter_loggers(master)}
+        groups = {lid: [f"(아카이브: {args.archive})"] for lid in archive_frames}
+        paths = list(groups)
+        print(f"아카이브에서 로거 {len(groups)}대 로드 ({len(master):,}행)")
+    else:
+        paths = []
+        for pattern in args.env:
+            hits = sorted(glob.glob(pattern))
+            paths.extend(hits if hits else [pattern])
+        groups = group_by_logger(paths)
     if not groups:
-        print("환경 파일을 찾지 못했습니다.", file=sys.stderr)
+        print("환경 파일을 찾지 못했습니다. --env 또는 --archive 를 지정하세요.", file=sys.stderr)
         return 2
 
     out_dir = Path(args.out)
@@ -135,7 +159,8 @@ def main() -> int:
     daily_all, summaries, gaps_all = [], [], []
     for logger_id, files in groups.items():
         print(f"[{logger_id}] {len(files)}개 파일...")
-        daily, summary, gap_report, _ = process_logger(logger_id, files, cfg, args, smap)
+        daily, summary, gap_report, _ = process_logger(
+            logger_id, files, cfg, args, smap, std=archive_frames.get(logger_id))
         summaries.append(summary)
 
         d = daily.copy()
@@ -160,17 +185,30 @@ def main() -> int:
     summary_df = pd.DataFrame(summaries)
 
     combined_interval = combined_merged = intervals = None
+    growth = None
     if args.growth:
         suffix = Path(args.growth).suffix.lower()
         growth = pd.read_excel(args.growth) if suffix in (".xlsx", ".xls") else pd.read_csv(args.growth)
         growth[args.growth_date_col] = pd.to_datetime(growth[args.growth_date_col])
-        cadence = preprocess.detect_cadence(growth[args.growth_date_col])
+
+    if any([args.survey_dates, args.survey_start]):
+        survey_dates = pd.Series(preprocess.parse_survey_dates(
+            dates=args.survey_dates, start=args.survey_start, interval=args.survey_interval,
+            count=args.survey_count, end=args.survey_end))
+        source = "사용자 지정"
+    elif growth is not None:
+        survey_dates = growth[args.growth_date_col]
+        source = "생육 파일"
+    else:
+        survey_dates = None
+
+    if survey_dates is not None:
+        cadence = preprocess.detect_cadence(survey_dates)
         lag = args.lag_days if args.lag_days is not None else int(pcfg.get("lag_days", 0))
         window = args.window_days if args.window_days is not None else pcfg.get("window_days")
-        intervals = preprocess.build_intervals(growth[args.growth_date_col],
-                                               first_start=args.first_start,
+        intervals = preprocess.build_intervals(survey_dates, first_start=args.first_start,
                                                lag_days=lag, window_days=window)
-        print(f"\n생육 조사 {growth[args.growth_date_col].nunique()}회 · 추정 간격 {cadence}일 · "
+        print(f"\n조사일 {pd.Series(survey_dates).nunique()}회({source}) · 추정 간격 {cadence}일 · "
               f"시차 {lag}일 → 구간 {len(intervals)}개")
 
         drop_incomplete = args.drop_incomplete_days or bool(pcfg.get("drop_incomplete_days"))
@@ -187,15 +225,17 @@ def main() -> int:
         combined_interval = pd.concat(parts, ignore_index=True)
         combined_interval.to_csv(out_dir / "all_loggers_interval.csv", index=False, encoding="utf-8-sig")
 
-        trt_col = args.growth_trt_col if args.growth_trt_col in growth.columns else None
+        trt_col = (args.growth_trt_col
+                   if growth is not None and args.growth_trt_col in growth.columns else None)
         if trt_col:
             missing = set(growth[trt_col].astype(str)) - set(combined_interval["trt"].astype(str))
             if missing:
                 print(f"⚠ 매핑에 없는 생육 처리구: {', '.join(sorted(missing))} "
                       f"→ config/sensor_map.yaml 의 처리구명을 생육자료와 맞추세요.")
-        combined_merged = preprocess.match_growth(growth, combined_interval,
-                                                  date_col=args.growth_date_col, trt_col=trt_col)
-        combined_merged.to_csv(out_dir / "all_loggers_merged.csv", index=False, encoding="utf-8-sig")
+        if growth is not None:
+            combined_merged = preprocess.match_growth(growth, combined_interval,
+                                                      date_col=args.growth_date_col, trt_col=trt_col)
+            combined_merged.to_csv(out_dir / "all_loggers_merged.csv", index=False, encoding="utf-8-sig")
 
     # --- Excel 통합 리포트 ------------------------------------------------
     xlsx = out_dir / "all_loggers_report.xlsx"
@@ -205,7 +245,8 @@ def main() -> int:
         if combined_interval is not None:
             intervals.to_excel(w, sheet_name="interval_definition", index=False)
             combined_interval.to_excel(w, sheet_name="all_interval", index=False)
-            combined_merged.to_excel(w, sheet_name="merged_env_growth", index=False)
+            if combined_merged is not None:
+                combined_merged.to_excel(w, sheet_name="merged_env_growth", index=False)
         (pd.concat(gaps_all, ignore_index=True) if gaps_all
          else pd.DataFrame({"note": ["결측 timestamp 없음"]})).to_excel(
             w, sheet_name="missing_timestamp", index=False)
@@ -217,6 +258,7 @@ def main() -> int:
           f"처리구 {combined_daily['trt'].nunique()}개)")
     if combined_interval is not None:
         print(f"  all_loggers_interval.csv  ({len(combined_interval):,}행)")
+    if combined_merged is not None:
         print(f"  all_loggers_merged.csv    ({len(combined_merged):,}행)")
     print(f"  all_loggers_report.xlsx")
     return 0

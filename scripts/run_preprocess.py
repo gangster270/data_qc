@@ -53,6 +53,21 @@ def read_growth(path: str, date_col: str) -> pd.DataFrame:
     return df
 
 
+def resolve_survey_dates(args, growth=None, date_col="date"):
+    """조사일을 정한다: 사용자 지정 > 생육파일. 없으면 None."""
+    if any([args.survey_dates, args.survey_start]):
+        dates = preprocess.parse_survey_dates(
+            dates=args.survey_dates, start=args.survey_start,
+            interval=args.survey_interval, count=args.survey_count, end=args.survey_end)
+        print(f"    조사일 {len(dates)}회 (사용자 지정): "
+              f"{', '.join(d.strftime('%Y-%m-%d') for d in dates[:4])}"
+              f"{' …' if len(dates) > 4 else ''}")
+        return pd.Series(dates)
+    if growth is not None and date_col in growth.columns:
+        return growth[date_col]
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="환경(10분) → 생육구간 시차 매칭 전처리")
     ap.add_argument("--env", nargs="+", required=True, help="환경 로거 파일 경로/글롭")
@@ -75,6 +90,12 @@ def main() -> int:
                     help="센서↔처리구 매핑을 적용해 처리구별로 집계·병합(한 로거의 센서가 서로 다른 처리구일 때)")
     ap.add_argument("--sensor-map", default=None, help="매핑 파일 경로(기본 config/sensor_map.yaml)")
     ap.add_argument("--growth-trt-col", default="trt", help="생육 자료의 처리구 열 이름(기본 trt)")
+    # --- 조사일 기준: 생육파일 없이도 사용자가 직접 지정할 수 있다 -------
+    ap.add_argument("--survey-dates", help='조사일 직접 지정 (예: "2026-04-01,2026-04-11,2026-04-21")')
+    ap.add_argument("--survey-start", help="조사 시작일 (예: 2026-04-01)")
+    ap.add_argument("--survey-interval", type=int, help="조사 간격(일). 예: 7 또는 10")
+    ap.add_argument("--survey-count", type=int, help="조사 횟수")
+    ap.add_argument("--survey-end", help="조사 종료일(횟수 대신 사용)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -159,18 +180,24 @@ def main() -> int:
 
     intervals = env_interval = merged = None
 
-    # --- 3) 생육 구간 매칭 ----------------------------------------------
-    if args.growth:
-        print("[3/4] 생육 구간 매칭 중...")
-        growth = read_growth(args.growth, args.growth_date_col)
-        cadence = preprocess.detect_cadence(growth[args.growth_date_col])
-        print(f"    조사일 {growth[args.growth_date_col].nunique()}회, 추정 조사간격 {cadence}일")
+    # --- 3) 구간 매칭 (조사일 기준: 사용자 지정 또는 생육파일) --------------
+    growth = read_growth(args.growth, args.growth_date_col) if args.growth else None
+    survey_dates = resolve_survey_dates(args, growth, args.growth_date_col)
+
+    if survey_dates is not None:
+        print("[3/4] 조사일 구간 매칭 중...")
+        cadence = preprocess.detect_cadence(survey_dates)
+        print(f"    조사일 {pd.Series(survey_dates).nunique()}회, 추정 조사간격 {cadence}일")
 
         intervals = preprocess.build_intervals(
-            growth[args.growth_date_col],
+            survey_dates,
             first_start=args.first_start, lag_days=lag_days, window_days=window_days)
         drop_incomplete = args.drop_incomplete_days or bool(pcfg.get("drop_incomplete_days"))
-        if by_trt:
+        if growth is None:
+            env_interval = (preprocess.aggregate_intervals_by_treatment(daily, intervals, drop_incomplete)
+                            if by_trt else preprocess.aggregate_intervals(daily, intervals, drop_incomplete))
+            merged = None
+        elif by_trt:
             env_interval = preprocess.aggregate_intervals_by_treatment(daily, intervals, drop_incomplete)
             trt_col = args.growth_trt_col if args.growth_trt_col in growth.columns else None
             if trt_col is None:
@@ -188,17 +215,20 @@ def main() -> int:
             merged = preprocess.match_growth(growth, env_interval, date_col=args.growth_date_col)
 
         env_interval.to_csv(out_dir / "env_interval_summary.csv", index=False, encoding="utf-8-sig")
-        merged.to_csv(out_dir / "merged_env_growth.csv", index=False, encoding="utf-8-sig")
+        if merged is not None:
+            merged.to_csv(out_dir / "merged_env_growth.csv", index=False, encoding="utf-8-sig")
+        made = "env_interval_summary.csv" + (", merged_env_growth.csv" if merged is not None else "")
         print(f"    구간 {len(env_interval)}개 (시차 {lag_days}일"
               f"{', 고정창 ' + str(window_days) + '일' if window_days else ''})"
-              f" → env_interval_summary.csv, merged_env_growth.csv")
+              f" → {made}")
         bad = env_interval[env_interval["quality_flag"] != "정상"] if "quality_flag" in env_interval else pd.DataFrame()
         if not bad.empty:
             print(f"    ⚠ 품질 주의 구간 {len(bad)}개:")
             for _, r in bad.iterrows():
                 print(f"      - 구간{r['interval_id']} ({r['env_start']:%m-%d}~{r['env_end']:%m-%d}): {r['quality_flag']}")
     else:
-        print("[3/4] 생육 파일 미지정 — 일별 요약까지만 생성")
+        print("[3/4] 조사일 미지정 — 일별 요약까지만 생성 "
+              "(--survey-start/--survey-interval/--survey-count 또는 --growth 로 지정)")
 
     # --- 4) Excel 리포트 -------------------------------------------------
     print("[4/4] Excel 리포트 작성 중...")
@@ -208,7 +238,8 @@ def main() -> int:
         if env_interval is not None:
             env_interval.to_excel(writer, sheet_name="env_interval_summary", index=False)
             intervals.to_excel(writer, sheet_name="interval_definition", index=False)
-            merged.to_excel(writer, sheet_name="merged_env_growth", index=False)
+            if merged is not None:
+                merged.to_excel(writer, sheet_name="merged_env_growth", index=False)
         map_report.to_excel(writer, sheet_name="column_mapping", index=False)
         if not map_coverage.empty:
             map_coverage.to_excel(writer, sheet_name="treatment_mapping", index=False)

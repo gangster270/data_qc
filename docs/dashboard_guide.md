@@ -40,7 +40,7 @@ streamlit run app/streamlit_app.py
 
 | 항목 | 설명 |
 |---|---|
-| **데이터 입력** | `파일 업로드`(내 PC 파일을 끌어다 놓기) 또는 `서버 경로`(서버에 있는 파일 경로 입력) |
+| **데이터 입력** | `파일 업로드`(내 PC 파일 끌어다 놓기) · `서버 경로`(경로 입력) · **`통합 아카이브`**(전체 환경데이터 마스터에서 로거 선택) |
 | **파일 선택** | `.xlsx/.xls/.csv/.txt/.tsv`, **여러 개 동시 선택 가능**(같은 로거의 분할 파일이면 자동 병합) |
 | **중복 센서 처리** | `first`(기본) / `mean`(같은 위치 반복일 때만) / `keep`(모두 보존) |
 | **🔍 자동 인식 결과 / 수정** | 시간 열·기록 간격·인식된 변수 목록. 인식이 틀렸을 때 여기서 열 의미를 바꾼다 |
@@ -86,7 +86,10 @@ streamlit run app/streamlit_app.py
 2. **처리구별 집계**(체크박스) — 한 로거의 센서가 처리구별로 꽂혀 있을 때 사용
    (`config/sensor_map.yaml` 에 포트↔처리구를 적어두어야 함)
 3. **① 일별 요약** — 10분(또는 다른 간격) 자료가 하루 단위로 접힌 표
-4. **② 생육조사 자료 업로드** — `date` 열이 있는 csv/xlsx. 조사간격 7·10일은 자동 인식
+4. **② 조사일 기준 정하기** — 세 가지 중 선택
+   - `시작일 + 간격` : 정식일과 7·10일 간격, 횟수(또는 종료일)만 넣으면 조사일이 자동 생성
+   - `조사일 직접 입력` : 실제 조사일을 쉼표로 나열(현장 사정으로 밀린 날짜 그대로 반영)
+   - `생육 파일 업로드` : `date` 열이 있는 csv/xlsx (조사간격 자동 인식, 생육값까지 병합)
 5. **③ 구간 정의** — 각 조사일에 어떤 환경 기간이 매칭됐는지
 6. **④ 구간별 환경 요약** / **⑤ 생육 + 환경 병합** ← **이게 최종 결과물**
 7. **다운로드** — `merged_env_growth.csv`(분석용) 또는 Excel 일괄
@@ -119,16 +122,43 @@ streamlit run app/streamlit_app.py
 
 ---
 
+## 3-1. 보유한 환경데이터 전부 모으기 (통합 아카이브)
+
+파일이 여러 로거·여러 번 내려받기로 흩어져 있다면 먼저 한 곳에 모은다.
+
+```bash
+# data/ 아래 모든 파일(하위 폴더 포함)을 하나로
+python scripts/build_archive.py --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive
+
+# 새로 내려받은 파일이 생기면 그것만 넣고 다시 실행 → 기존 마스터에 이어붙음
+python scripts/build_archive.py --env "data/신규/*.xlsx" --out outputs/archive
+```
+
+- 형식·인코딩·기록간격·변수명을 자동 인식해 **날짜순 정렬 + 변수 표준화 + 중복 정리**
+- `env_master.csv`(원자료 보존)와 `env_master_clean.csv`(범위이탈 결측처리 + 격자정합) 두 벌 생성
+- 대시보드 사이드바에서 `통합 아카이브` 를 고르면 이 마스터를 그대로 불러 쓴다
+- 모니터링도 아카이브 전체를 로거별로 한 번에 점검:
+  `python scripts/run_monitor.py --archive outputs/archive --by-logger`
+
+---
+
 ## 4. 대시보드 없이 파일로만 확인하기
 
 터미널만으로도 같은 결과를 얻는다(자동 실행·정기 리포트에 적합).
 
 ```bash
-# 전처리: 환경 + 생육 → 분석용 파일
-python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv --out outputs/
+# 통합: 보유한 모든 환경데이터를 하나로
+python scripts/build_archive.py --env "data/**/*.xlsx" --out outputs/archive
 
-# 모니터링: 최근 7일 점검 + 알림
-python scripts/run_monitor.py --env "data/*.xlsx" --lookback 7
+# 전처리: 조사일을 직접 정해 시차 매칭(생육 파일 없이도 가능)
+python scripts/run_all_loggers.py --archive outputs/archive --by-treatment \
+       --survey-start 2026-04-01 --survey-interval 10 --survey-count 6 --out outputs/all
+
+# 전처리: 생육 파일이 있으면 병합까지
+python scripts/run_all_loggers.py --archive outputs/archive --growth data/growth.csv --out outputs/all
+
+# 모니터링: 아카이브 전체를 로거별로 점검 + 알림
+python scripts/run_monitor.py --archive outputs/archive --by-logger --lookback 7
 ```
 
 생성되는 파일

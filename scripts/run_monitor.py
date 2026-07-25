@@ -27,7 +27,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import alerts as alert_mod            # noqa: E402
-from src import io_logger, qc_rules            # noqa: E402
+from src import archive, io_logger, qc_rules   # noqa: E402
 from src.config import load_config             # noqa: E402
 
 
@@ -60,7 +60,10 @@ def load_standardized(paths: list[str], cfg: dict, replicate: str = "first"):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="환경 로거 결측·센서오류 자동 모니터링")
-    ap.add_argument("--env", nargs="+", required=True, help="환경 로거 파일 경로/글롭")
+    ap.add_argument("--env", nargs="+", help="환경 로거 파일 경로/글롭")
+    ap.add_argument("--archive", help="통합 아카이브 디렉터리 또는 env_master.csv 경로")
+    ap.add_argument("--by-logger", action="store_true",
+                    help="로거별로 나눠 점검(아카이브에 여러 로거가 있을 때 권장)")
     ap.add_argument("--config", default=None, help="설정 파일 경로")
     ap.add_argument("--lookback", type=int, default=7, help="점검 대상 기간(일, 기본 7)")
     ap.add_argument("--replicate", choices=["first", "mean", "keep"], default="first")
@@ -73,28 +76,68 @@ def main() -> int:
     if args.json:
         # stdout 을 JSON 전용으로 비운다(콘솔 알림문과 섞이면 파이프 파싱이 깨진다)
         cfg["alerts"]["channels"]["console"] = False
-    paths = expand_paths(args.env)
-    if not paths:
-        print("환경 파일을 찾지 못했습니다.", file=sys.stderr)
-        return 2
-
-    grid, context, extra = load_standardized(paths, cfg, replicate=args.replicate)
     now = pd.Timestamp(args.now) if args.now else None
 
-    alerts = qc_rules.run_all(grid, cfg, lookback_days=args.lookback, now=now,
-                              map_report=extra.get("mapping"))
-    health = qc_rules.health_score(grid, cfg, days=args.lookback)
+    if args.archive:
+        # 통합 아카이브(여러 로거) 점검 — 로거별로 나눠 규칙을 적용한다
+        master = archive.load_master(args.archive, clean=False)
+        frames = list(archive.iter_loggers(master)) if args.by_logger else [("(전체)", master)]
+        alerts_all, health_all, contexts = [], [], []
+        for logger_id, df in frames:
+            if "logger" in df.columns:
+                df = df.drop(columns=["logger"])
+            interval = qc_rules.resolve_interval(cfg, df)
+            grid_l, _ = io_logger.reindex_full_grid(df, interval_minutes=interval)
+            a = qc_rules.run_all(grid_l, cfg, lookback_days=args.lookback, now=now)
+            if not a.empty:
+                a.insert(0, "logger", logger_id)
+                a["key"] = logger_id + "|" + a["key"]      # 로거별로 쿨다운 분리
+                alerts_all.append(a)
+            h = qc_rules.health_score(grid_l, cfg, days=args.lookback)
+            if not h.empty:
+                h.insert(0, "로거", logger_id)
+                health_all.append(h)
+            contexts.append({
+                "logger": logger_id, "n_rows": len(df),
+                "start": str(df["timestamp"].min()), "end": str(df["timestamp"].max()),
+                "n_missing_ts": int((grid_l["qc_status"] == "missing_timestamp_inserted").sum()),
+                "interval_minutes": interval,
+            })
+        alerts = (pd.concat(alerts_all, ignore_index=True) if alerts_all
+                  else qc_rules.run_all(pd.DataFrame(columns=["timestamp"]), cfg))
+        health = pd.concat(health_all, ignore_index=True) if health_all else pd.DataFrame()
+        context = {
+            "start": min(c["start"] for c in contexts), "end": max(c["end"] for c in contexts),
+            "n_rows": int(sum(c["n_rows"] for c in contexts)),
+            "n_missing_ts": int(sum(c["n_missing_ts"] for c in contexts)),
+            "n_files": len(contexts),
+            "interval_minutes": contexts[0]["interval_minutes"] if contexts else 10,
+        }
+        variables = sorted(qc_rules.value_columns(master))
+    else:
+        paths = expand_paths(args.env or [])
+        if not paths:
+            print("환경 파일을 찾지 못했습니다. --env 또는 --archive 를 지정하세요.", file=sys.stderr)
+            return 2
+        grid, context, extra = load_standardized(paths, cfg, replicate=args.replicate)
+        alerts = qc_rules.run_all(grid, cfg, lookback_days=args.lookback, now=now,
+                                  map_report=extra.get("mapping"))
+        health = qc_rules.health_score(grid, cfg, days=args.lookback)
+        variables = sorted(qc_rules.value_columns(grid))
+
     result = alert_mod.dispatch(alerts, cfg, context=context, health=health, dry_run=args.dry_run)
 
     summary = {
         **qc_rules.summarize(alerts),
         "interval_minutes": context["interval_minutes"],
-        "variables": sorted(qc_rules.value_columns(grid)),
+        "variables": variables,
         "sent": result["n_sent"],
         "report": result.get("report_path"),
         "period": f"{context['start']} ~ {context['end']}",
         "missing_timestamps": context["n_missing_ts"],
     }
+    if args.archive and not alerts.empty and "logger" in alerts.columns:
+        summary["by_logger"] = alerts.groupby("logger").size().to_dict()
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
 

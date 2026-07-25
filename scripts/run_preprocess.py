@@ -32,8 +32,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import io_logger, preprocess          # noqa: E402
-from src.config import load_config             # noqa: E402
+from src import io_logger, preprocess, sensor_map   # noqa: E402
+from src.config import load_config                  # noqa: E402
 
 
 def expand_paths(patterns: list[str]) -> list[str]:
@@ -71,6 +71,10 @@ def main() -> int:
                     help="레코드 완전성 기준 미달일을 구간 집계에서 제외")
     ap.add_argument("--keep-out-of-range", action="store_true",
                     help="센서 물리범위 이탈값을 결측 처리하지 않고 그대로 집계(기본은 결측 처리)")
+    ap.add_argument("--by-treatment", action="store_true",
+                    help="센서↔처리구 매핑을 적용해 처리구별로 집계·병합(한 로거의 센서가 서로 다른 처리구일 때)")
+    ap.add_argument("--sensor-map", default=None, help="매핑 파일 경로(기본 config/sensor_map.yaml)")
+    ap.add_argument("--growth-trt-col", default="trt", help="생육 자료의 처리구 열 이름(기본 trt)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -115,17 +119,41 @@ def main() -> int:
     else:
         range_report = pd.DataFrame()
 
-    daily = preprocess.to_daily(
-        clean,
+    daily_kwargs = dict(
         interval_minutes=interval,
         gdd_base=gdd_base,
         photoperiod_ppfd_threshold=float(pcfg.get("photoperiod_ppfd_threshold", 10)),
         daytime_hours=tuple(pcfg.get("daytime_hours", [9, 15])),
         min_completeness=float(pcfg.get("daily_min_completeness", 0.9)),
     )
+
+    # 처리구별 집계: 한 로거의 센서들이 서로 다른 처리구를 잴 때
+    by_trt, map_coverage = False, pd.DataFrame()
+    if args.by_treatment:
+        smap = sensor_map.load_sensor_map(args.sensor_map)
+        entry = sensor_map.resolve_logger(smap, Path(paths[0]).name)
+        if not entry or not entry.get("treatments"):
+            print(f"    ⚠ 매핑 없음({Path(paths[0]).name}) — 처리구 구분 없이 진행합니다. "
+                  f"config/sensor_map.yaml 을 확인하세요.")
+        else:
+            frames = sensor_map.split_by_treatment(clean, entry)
+            map_coverage = sensor_map.coverage_report(clean, entry)
+            daily = preprocess.to_daily_by_treatment(frames, **daily_kwargs)
+            by_trt = True
+            print(f"    처리구 {len(frames)}개로 분리: {', '.join(frames)} "
+                  f"(공통변수: {', '.join(entry.get('shared', [])) or '없음'})")
+            unmapped = map_coverage[map_coverage["매핑"] == "미매핑"]["열"].tolist()
+            if unmapped:
+                print(f"    ⚠ 매핑되지 않은 열: {', '.join(unmapped)}")
+
+    if not by_trt:
+        daily = preprocess.to_daily(clean, **daily_kwargs)
+
     daily.to_csv(out_dir / "daily_env_summary.csv", index=False, encoding="utf-8-sig")
     n_incomplete = int((~daily["is_complete"]).sum()) if "is_complete" in daily else 0
-    print(f"    일별 {len(daily)}일 (불완전일 {n_incomplete}일) → daily_env_summary.csv")
+    n_days = daily["date"].nunique() if "date" in daily else 0
+    print(f"    일별 {n_days}일{' × 처리구 ' + str(daily['trt'].nunique()) if by_trt else ''} "
+          f"(불완전일 {n_incomplete}건) → daily_env_summary.csv")
 
     intervals = env_interval = merged = None
 
@@ -139,10 +167,23 @@ def main() -> int:
         intervals = preprocess.build_intervals(
             growth[args.growth_date_col],
             first_start=args.first_start, lag_days=lag_days, window_days=window_days)
-        env_interval = preprocess.aggregate_intervals(
-            daily, intervals,
-            drop_incomplete_days=args.drop_incomplete_days or bool(pcfg.get("drop_incomplete_days")))
-        merged = preprocess.match_growth(growth, env_interval, date_col=args.growth_date_col)
+        drop_incomplete = args.drop_incomplete_days or bool(pcfg.get("drop_incomplete_days"))
+        if by_trt:
+            env_interval = preprocess.aggregate_intervals_by_treatment(daily, intervals, drop_incomplete)
+            trt_col = args.growth_trt_col if args.growth_trt_col in growth.columns else None
+            if trt_col is None:
+                print(f"    ⚠ 생육 자료에 '{args.growth_trt_col}' 열이 없어 처리구 병합을 건너뜁니다. "
+                      f"실제 열: {list(growth.columns)}")
+            else:
+                missing = set(growth[trt_col].astype(str)) - set(env_interval["trt"].astype(str))
+                if missing:
+                    print(f"    ⚠ 매핑에 없는 생육 처리구: {', '.join(sorted(missing))} "
+                          f"→ config/sensor_map.yaml 의 처리구명을 생육자료와 일치시키세요.")
+            merged = preprocess.match_growth(growth, env_interval,
+                                             date_col=args.growth_date_col, trt_col=trt_col)
+        else:
+            env_interval = preprocess.aggregate_intervals(daily, intervals, drop_incomplete)
+            merged = preprocess.match_growth(growth, env_interval, date_col=args.growth_date_col)
 
         env_interval.to_csv(out_dir / "env_interval_summary.csv", index=False, encoding="utf-8-sig")
         merged.to_csv(out_dir / "merged_env_growth.csv", index=False, encoding="utf-8-sig")
@@ -167,6 +208,8 @@ def main() -> int:
             intervals.to_excel(writer, sheet_name="interval_definition", index=False)
             merged.to_excel(writer, sheet_name="merged_env_growth", index=False)
         map_report.to_excel(writer, sheet_name="column_mapping", index=False)
+        if not map_coverage.empty:
+            map_coverage.to_excel(writer, sheet_name="treatment_mapping", index=False)
         (range_report if not range_report.empty else pd.DataFrame({"note": ["범위 이탈값 없음"]})) \
             .to_excel(writer, sheet_name="out_of_range", index=False)
         (gap_report if not gap_report.empty else pd.DataFrame({"note": ["결측 timestamp 없음"]})) \

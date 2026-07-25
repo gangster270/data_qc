@@ -335,33 +335,33 @@ def standardize(df: pd.DataFrame, replicate: str = "first") -> tuple[pd.DataFram
         if not usable:
             continue
 
-        # 살아 있는 센서를 앞으로: 전 구간 0·상수인 죽은 포트가 대표가 되지 않도록 재정렬
         alive = [c for c in usable if _is_informative(block[c])]
-        dead = [c for c in usable if c not in alive]
-        usable = alive + dead                     # 대표는 항상 alive 에서 먼저 고른다
         dead_note = " ※죽은 포트(전 구간 0·상수)"
 
         def _note(col: str, text: str) -> str:
-            return text + (dead_note if col in dead else "")
+            return text + (dead_note if col not in alive else "")
 
-        if replicate == "keep" and len(usable) > 1:
-            for i, c in enumerate(usable, start=1):
-                out[f"{key}_{i}"] = block[c].to_numpy()
-                rows[c]["채택"] = _note(c, f"{key}_{i}")
-        elif replicate == "mean" and len(alive) > 1:
+        if len(usable) == 1:
+            out[key] = block[usable[0]].to_numpy()
+            rows[usable[0]]["채택"] = _note(usable[0], key)
+            continue
+
+        # 센서가 여러 개면 **파일에 실린 포트 순서 그대로** var__rep1..N 으로 보존한다.
+        # (순서를 바꾸면 처리구 매핑(config/sensor_map.yaml)이 어긋난다)
+        for i, c in enumerate(usable, start=1):
+            out[f"{key}__rep{i}"] = block[c].to_numpy()
+            rows[c]["채택"] = _note(c, f"{key}__rep{i}")
+
+        # 대표 열(key)은 별도로 고른다: 살아 있는 첫 센서, 없으면 첫 센서.
+        if replicate == "mean" and len(alive) > 1:
             # 평균은 살아 있는 센서끼리만. 죽은 0값을 섞으면 평균이 절반으로 꺼진다.
             out[key] = block[alive].mean(axis=1).to_numpy()
-            for i, c in enumerate(usable, start=1):
-                out[f"{key}__rep{i}"] = block[c].to_numpy()
-                rows[c]["채택"] = _note(c, f"{key}(평균 대상) / {key}__rep{i}" if c in alive
-                                        else f"{key}__rep{i}")
-        else:
-            first = usable[0]
-            out[key] = block[first].to_numpy()
-            rows[first]["채택"] = _note(first, key)
-            for i, c in enumerate(usable[1:], start=2):
-                out[f"{key}__rep{i}"] = block[c].to_numpy()   # 상호비교용 보존
-                rows[c]["채택"] = _note(c, f"{key}__rep{i}")
+            for c in alive:
+                rows[c]["채택"] += f" → {key}(평균 대상)"
+        elif replicate != "keep":
+            rep = alive[0] if alive else usable[0]
+            out[key] = block[rep].to_numpy()
+            rows[rep]["채택"] += f" → {key}(대표)"
 
     report = pd.DataFrame(list(rows.values()))
     ordered = ["timestamp"] + [c for c in STANDARD_ORDER if c in out.columns] + \

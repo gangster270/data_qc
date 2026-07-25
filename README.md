@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
-python tests/test_pipeline.py           # 13/13 통과
+python tests/test_pipeline.py           # 16/16 통과
 
 # 1) 전처리 — 환경 10분 → 생육 구간 매칭
 python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
@@ -59,6 +59,8 @@ streamlit run app/streamlit_app.py
 - 조사간격 7·10일은 **자동 추정**, 불규칙 간격도 그대로 처리
 - 범위 이탈값(-99.9 등)은 집계 전에 결측 처리하고 처리 건수를 리포트에 남김
 - 구간별 `quality_flag` 로 일수부족·레코드결측을 표시 → **플래그 붙은 구간은 분석에서 제외**
+- **처리구별 집계**: 한 로거의 센서가 처리구별로 꽂혀 있으면 `config/sensor_map.yaml` 에
+  포트↔처리구를 적고 `--by-treatment` → 생육 자료와 (조사일 × 처리구)로 병합
 
 산출물: `daily_env_summary.csv`, `env_interval_summary.csv`,
 **`merged_env_growth.csv`**(분석 투입용), `preprocess_report.xlsx`
@@ -81,7 +83,7 @@ R 버전(통계·그래프를 R 에서 이어갈 때): [`R/env_growth_match.R`](
 | R07 `night_light` | 야간 광 검출 ※ **야간보광(NI/SL) 시험 중이면 비활성 유지** |
 | R08 `rh_saturated` | 습도 99% 이상 장시간(결로·필터 오염) |
 | R09 `logger_offline` | 최신 관측 지연(전원·통신) |
-| R10 `pair_divergence` | 중복 센서 간 편차 초과(드리프트) |
+| R10 `pair_divergence` | 중복 센서 간 편차 초과(드리프트) ※ 반복 센서가 서로 다른 처리구인 현장은 **기본 비활성** |
 | R11 `transmittance_drop` | 내부PPFD/외부일사 비율 급락(오염·차광막) |
 | R12 `error_value` | `#VALUE!`·`ERROR`·`inf` 등 진성 오류값 |
 | R13 `heat_event` | 작물 위험 수준 고온(기온 45℃·배지온도 40℃ 초과) — 센서 오류가 아닌 실제 사건 |
@@ -152,16 +154,18 @@ streamlit run app/streamlit_app.py
 
 ```
 config/qc_config.yaml          임계값·알림·검증주기 (단일 설정 지점)
+config/sensor_map.yaml         포트 ↔ 처리구 매핑 (처리구별 집계용)
 src/io_logger.py               ZL6 형식 읽기, 열 표준화, 10분 격자 정합
 src/preprocess.py              일별·구간 집계, 시차 매칭, 범위 이탈 처리
 src/qc_rules.py                QC 규칙 13종 + 센서 상태표
 src/alerts.py                  중복 억제, 리포트, 채널 발송
 src/sensor_check.py            검증 로그·기한·상호비교·드리프트
+src/sensor_map.py              센서↔처리구 매핑, 처리구 분리
 scripts/run_preprocess.py      전처리 CLI
 scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
-tests/                         합성 자료 생성기 + 검증 테스트 13종
+tests/                         합성 자료 생성기 + 검증 테스트 16종
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식
 ```

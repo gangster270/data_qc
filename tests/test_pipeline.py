@@ -18,7 +18,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src import io_logger, preprocess, qc_rules, sensor_check   # noqa: E402
+from src import io_logger, preprocess, qc_rules, sensor_check, sensor_map   # noqa: E402
 from src.config import load_config                              # noqa: E402
 
 SAMPLE = ROOT / "tests" / "sample" / "z6-99999_260601-0900.xlsx"
@@ -218,6 +218,86 @@ def test_cross_check():
     res2 = sensor_check.cross_check(grid.assign(temp_b=grid["temp"] + 1.5), "temp", "temp_b", "temp", CFG)
     assert res2["result"] == "fail" and abs(res2["bias"] - 1.5) < 1e-6
     print("✓ 센서 상호비교 판정")
+
+
+def test_stable_replicate_naming():
+    """중복 센서 열 번호는 파일의 포트 순서를 그대로 따라야 한다.
+
+    번호가 '살아 있는 센서 우선' 로 재정렬되면 처리구 매핑이 통째로 어긋난다.
+    """
+    ts = pd.date_range("2026-05-01", periods=200, freq="10min")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "% Water Content": 0.0,                      # 미연결 포트(전 구간 0)
+        "% Water Content.1": np.linspace(30, 33, 200),
+        " °C Air Temperature": np.linspace(20, 25, 200),
+    })
+    std, rep = io_logger.standardize(df)
+    assert (std["vwc__rep1"] == 0).all()             # 포트 순서 유지
+    assert std["vwc__rep2"].iloc[0] == 30
+    # 대표 열은 살아 있는 센서를 가리킨다
+    assert std["vwc"].iloc[0] == 30
+    assert "죽은 포트" in rep.loc[rep["원본열"] == "% Water Content", "채택"].iloc[0]
+    # 센서 열 목록에는 대표 열의 복사본이 중복으로 들어가지 않는다
+    assert qc_rules.sensor_columns(std, "vwc") == ["vwc__rep1", "vwc__rep2"]
+    assert qc_rules.sensor_columns(std, "temp") == ["temp"]
+    print("✓ 중복 센서 열 번호 안정성(포트 순서 유지)")
+
+
+def test_treatment_split_and_merge():
+    """한 로거의 센서가 서로 다른 처리구일 때, 처리구별로 분리·집계·병합된다."""
+    ts = pd.date_range("2026-05-01", periods=144 * 14, freq="10min")
+    hour = ts.hour + ts.minute / 60
+    n = len(ts)
+    std = pd.DataFrame({
+        "timestamp": ts,
+        "ppfd": np.clip(np.sin((hour - 6) / 13 * np.pi), 0, None) * 900,   # 구역 공통
+        "vwc__rep1": np.full(n, 25.0), "vwc__rep2": np.full(n, 40.0),
+        "soil_temp__rep1": np.full(n, 22.0), "soil_temp__rep2": np.full(n, 24.0),
+    })
+    entry = {
+        "zone": "온실A", "shared": ["ppfd"],
+        "treatments": {
+            "NI": {"vwc": "vwc__rep1", "soil_temp": "soil_temp__rep1"},
+            "NI+SL": {"vwc": "vwc__rep2", "soil_temp": "soil_temp__rep2"},
+        },
+    }
+    frames = sensor_map.split_by_treatment(std, entry)
+    assert set(frames) == {"NI", "NI+SL"}
+    assert frames["NI"]["vwc"].iloc[0] == 25.0 and frames["NI+SL"]["vwc"].iloc[0] == 40.0
+    assert "ppfd" in frames["NI"].columns                  # 공통 변수 복사
+
+    daily = preprocess.to_daily_by_treatment(frames, interval_minutes=10)
+    assert set(daily["trt"]) == {"NI", "NI+SL"}
+    assert daily.groupby("trt")["vwc_mean"].first().to_dict() == {"NI": 25.0, "NI+SL": 40.0}
+
+    growth = pd.DataFrame({
+        "date": pd.to_datetime(["2026-05-07", "2026-05-07", "2026-05-14", "2026-05-14"]),
+        "trt": ["NI", "NI+SL", "NI", "NI+SL"],
+        "fresh_wt": [10.0, 12.0, 20.0, 24.0],
+    })
+    iv = preprocess.build_intervals(growth["date"], first_start="2026-05-01")
+    env_iv = preprocess.aggregate_intervals_by_treatment(daily, iv)
+    assert len(env_iv) == 4                                 # 구간 2 × 처리구 2
+    merged = preprocess.match_growth(growth, env_iv, trt_col="trt")
+    assert len(merged) == len(growth) and merged["vwc_mean"].notna().all()
+    # 각 생육행에 '자기 처리구' 배지환경이 붙었는지
+    assert merged.loc[merged["trt"] == "NI", "vwc_mean"].eq(25.0).all()
+    assert merged.loc[merged["trt"] == "NI+SL", "vwc_mean"].eq(40.0).all()
+    # 공통 광환경은 처리구와 무관하게 동일
+    assert merged.groupby("date")["dli_sum"].nunique().eq(1).all()
+    print("✓ 처리구별 분리·집계·병합")
+
+
+def test_pair_divergence_disabled_by_default():
+    """반복 센서가 서로 다른 처리구인 현장 설정에서는 편차 경보가 뜨지 않아야 한다."""
+    ts = pd.date_range("2026-05-01", periods=300, freq="10min")
+    df = pd.DataFrame({"timestamp": ts,
+                       "vwc__rep1": np.full(300, 25.0), "vwc__rep2": np.full(300, 45.0)})
+    assert qc_rules.check_pair_divergence(df, CFG) == []
+    on = {**CFG, "qc": {**CFG["qc"], "pair_divergence_enabled": True}}
+    assert len(qc_rules.check_pair_divergence(df, on)) == 1     # 켜면 정상 작동
+    print("✓ 중복센서 편차 규칙 기본 비활성")
 
 
 def test_judge_tolerance():

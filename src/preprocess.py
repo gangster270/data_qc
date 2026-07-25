@@ -345,14 +345,60 @@ def aggregate_intervals(daily: pd.DataFrame, intervals: pd.DataFrame,
 # Step 3. 생육 데이터와 병합
 # ---------------------------------------------------------------------
 def match_growth(growth: pd.DataFrame, env_interval: pd.DataFrame,
-                 date_col: str = "date") -> pd.DataFrame:
-    """생육 각 측정행에 해당 구간의 환경 요약을 붙인다."""
+                 date_col: str = "date", trt_col: str | None = None) -> pd.DataFrame:
+    """생육 각 측정행에 해당 구간의 환경 요약을 붙인다.
+
+    trt_col 을 주면 (조사일 × 처리구)로 병합한다. 한 로거의 센서들이 서로 다른
+    처리구를 재는 경우, 처리구를 무시하고 붙이면 다른 처리구의 배지환경이
+    섞여 들어가므로 반드시 처리구까지 맞춰야 한다.
+    """
     g = growth.copy()
     g[date_col] = pd.to_datetime(g[date_col])
+    if trt_col and "trt" in env_interval.columns:
+        merged = g.merge(env_interval, how="left",
+                         left_on=[date_col, trt_col], right_on=["growth_date", "trt"])
+        drop = [c for c in ("growth_date",) if c in merged.columns]
+        if trt_col != "trt" and "trt" in merged.columns:
+            drop.append("trt")
+        return merged.drop(columns=drop)
     merged = g.merge(env_interval, how="left", left_on=date_col, right_on="growth_date")
     if "growth_date" in merged.columns and date_col != "growth_date":
         merged = merged.drop(columns=["growth_date"])
     return merged
+
+
+# ---------------------------------------------------------------------
+# 처리구별 집계 (한 로거의 센서들이 서로 다른 처리구를 잴 때)
+# ---------------------------------------------------------------------
+def to_daily_by_treatment(frames: dict[str, pd.DataFrame], **kwargs) -> pd.DataFrame:
+    """처리구별 10분 자료를 각각 일별 요약한 뒤 하나로 합친다(trt 열 추가)."""
+    parts = []
+    for trt, df in (frames or {}).items():
+        daily = to_daily(df, **kwargs)
+        if daily.empty:
+            continue
+        daily.insert(0, "trt", trt)
+        parts.append(daily)
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True).sort_values(["trt", "date"]).reset_index(drop=True)
+
+
+def aggregate_intervals_by_treatment(daily: pd.DataFrame, intervals: pd.DataFrame,
+                                     drop_incomplete_days: bool = False) -> pd.DataFrame:
+    """처리구별 일별 요약을 같은 구간 정의로 각각 집계한다(trt 열 유지)."""
+    if daily.empty or "trt" not in daily.columns:
+        return aggregate_intervals(daily, intervals, drop_incomplete_days)
+    parts = []
+    for trt, sub in daily.groupby("trt", sort=True):
+        agg = aggregate_intervals(sub.drop(columns=["trt"]), intervals, drop_incomplete_days)
+        if agg.empty:
+            continue
+        agg.insert(0, "trt", trt)
+        parts.append(agg)
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True).sort_values(["trt", "interval_id"]).reset_index(drop=True)
 
 
 def add_growth_rate(merged: pd.DataFrame, value_cols: list[str],

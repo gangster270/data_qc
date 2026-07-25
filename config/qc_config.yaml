@@ -83,7 +83,11 @@ qc:
   offline_warn_minutes: 120
   offline_critical_minutes: 720
 
-  # 중복 센서 편차(같은 환경에 설치된 동일 종류 센서 간)
+  # 중복 센서 편차(같은 환경에 나란히 설치된 동일 종류 센서 간)
+  #   ※ 본 현장은 한 로거의 반복 센서가 서로 다른 처리구를 재므로 기본 비활성.
+  #     (처리구가 다르면 편차는 정상이며, 경보는 전부 오탐이 된다)
+  #     교정 목적으로 두 센서를 나란히 놓고 비교할 때만 true 로 켠다.
+  pair_divergence_enabled: false
   pair_divergence:
     temp:      1.0     # ℃
     soil_temp: 1.0     # ℃

@@ -85,6 +85,32 @@
 
 ---
 
+### 3.4 처리구별 집계 (한 로거의 센서가 서로 다른 처리구일 때)
+
+한 로거의 TEROS/SQ-521 이 처리구별로 하나씩 꽂혀 있으면, 대표 센서 하나만 쓰면
+다른 처리구의 배지환경이 잘못 붙는다. `config/sensor_map.yaml` 에 포트↔처리구를 적고
+`--by-treatment` 로 실행하면 다음이 처리구 단위로 수행된다.
+
+```
+10분 자료 → 처리구별 분리 → 처리구별 일별 요약 → 처리구별 구간 집계
+                                              → 생육(조사일 × 처리구) 병합
+```
+
+- 매핑 키(`TRT1` 자리)는 **생육자료의 처리구 값과 정확히 같아야** 병합된다.
+  다르면 실행 중 "매핑에 없는 생육 처리구" 경고가 뜬다.
+- `shared` 에 적은 변수(기온·PPFD 등 구역에 하나뿐인 센서)는 모든 처리구에 동일 적용된다.
+- 열 번호 `var__rep1..N` 은 **파일의 포트 순서**를 그대로 따른다. 죽은 포트가 있어도
+  번호가 밀리지 않으므로 매핑이 어긋나지 않는다(대표 열은 살아 있는 센서로 따로 고른다).
+
+```bash
+python scripts/run_preprocess.py --env "data/z6-20917_*.xlsx" --growth data/growth.csv \
+       --by-treatment --growth-trt-col trt --first-start 2026-05-28 --out outputs/
+```
+
+산출되는 `env_interval_summary.csv`·`merged_env_growth.csv` 에는 `trt` 열이 추가된다.
+
+---
+
 ## 4. 산출물
 
 | 파일 | 내용 |
@@ -110,7 +136,11 @@ python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
 python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
     --lag-days 3 --window-days 10 --drop-incomplete-days --out outputs/lag3/
 
-# 중복 PPFD 센서를 공간반복으로 평균
+# 처리구별 집계(한 로거의 센서가 처리구별로 꽂혀 있을 때)
+python scripts/run_preprocess.py --env "data/z6-20917_*.xlsx" --growth data/growth.csv \
+    --by-treatment --growth-trt-col trt --out outputs/
+
+# (참고) 중복 센서가 '같은 위치의 공간반복'인 경우에만 평균
 python scripts/run_preprocess.py --env "data/*.xlsx" --replicate mean --out outputs/
 ```
 
@@ -129,6 +159,7 @@ python scripts/run_preprocess.py --env "data/*.xlsx" --replicate mean --out outp
 | 조사간격 7·10일 하드코딩 | 조사일에서 자동 추정, 불규칙 허용 |
 | -99.9 등 오류값을 그대로 평균 | 범위 이탈값 결측 처리 후 집계 |
 | 10분 원자료 QC 없이 집계 | 먼저 모니터링(`run_monitor.py`)으로 결측·오류 확인 |
+| 처리구별 센서를 평균내 하나로 | 처리구가 다르면 `sensor_map.yaml` + `--by-treatment` 로 분리 |
 | 타임존 불일치로 날짜 경계 어긋남 | timestamp 를 KST 로 통일 후 `date` 산출 |
 
 ---

@@ -24,7 +24,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import alerts as alert_mod          # noqa: E402
-from src import io_logger, preprocess, qc_rules, sensor_check   # noqa: E402
+from src import io_logger, preprocess, qc_rules, sensor_check, sensor_map   # noqa: E402
 from src.config import PROJECT_ROOT, load_config, resolve_path  # noqa: E402
 
 st.set_page_config(page_title="환경데이터 QC 대시보드", page_icon="🌱", layout="wide")
@@ -91,6 +91,7 @@ if source_mode == "파일 업로드":
                                    type=["xlsx", "xls", "csv"], accept_multiple_files=True)
     if ups:
         payload = [(u.name, u.getvalue()) for u in ups]
+        st.session_state["loaded_names"] = [u.name for u in ups]
         with st.spinner("파일 처리 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_bytes(
                 payload, int(cfg["site"]["interval_minutes"]), replicate)
@@ -105,6 +106,7 @@ else:
         else:
             st.session_state["paths"] = paths
     if st.session_state.get("paths"):
+        st.session_state["loaded_names"] = [Path(p).name for p in st.session_state["paths"]]
         with st.spinner("파일 처리 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_paths(
                 st.session_state["paths"], int(cfg["site"]["interval_minutes"]), replicate)
@@ -257,17 +259,51 @@ with tab_pre:
                 st.warning("범위 이탈값 결측 처리: " +
                            ", ".join(f"{r['변수']} {r['결측처리건수']:,}건" for _, r in range_report.iterrows()))
 
-        daily = preprocess.to_daily(
-            clean,
+        daily_kwargs = dict(
             interval_minutes=int(cfg["site"]["interval_minutes"]),
             gdd_base=float(gdd_base),
             photoperiod_ppfd_threshold=float(pcfg.get("photoperiod_ppfd_threshold", 10)),
             daytime_hours=tuple(pcfg.get("daytime_hours", [9, 15])),
             min_completeness=float(pcfg.get("daily_min_completeness", 0.9)),
         )
+
+        # --- 처리구별 집계(센서↔처리구 매핑) --------------------------------
+        smap = sensor_map.load_sensor_map()
+        logger_names = list((smap.get("loggers") or {}).keys())
+        by_trt, map_coverage, frames = False, pd.DataFrame(), {}
+        if logger_names:
+            loaded = (st.session_state.get("loaded_names") or [""])[0]
+            guess = sensor_map.logger_id_from_filename(loaded)
+            default_idx = next((i for i, n in enumerate(logger_names) if n in guess or guess in n), 0)
+            t1, t2 = st.columns([1, 2])
+            use_map = t1.checkbox("처리구별 집계", value=False,
+                                  help="한 로거의 센서들이 서로 다른 처리구를 잴 때 사용 "
+                                       "(config/sensor_map.yaml)")
+            logger_key = t2.selectbox("로거", logger_names, index=default_idx, disabled=not use_map)
+            if use_map:
+                entry = (smap.get("loggers") or {}).get(logger_key) or {}
+                frames = sensor_map.split_by_treatment(clean, entry)
+                if not frames:
+                    st.error(f"'{logger_key}' 에 처리구 매핑이 없습니다. config/sensor_map.yaml 의 "
+                             f"treatments 를 채우세요.")
+                else:
+                    map_coverage = sensor_map.coverage_report(clean, entry)
+                    daily = preprocess.to_daily_by_treatment(frames, **daily_kwargs)
+                    by_trt = True
+                    st.success(f"처리구 {len(frames)}개로 분리: {', '.join(frames)} · "
+                               f"공통변수 {', '.join(entry.get('shared', [])) or '없음'}")
+                    unmapped = map_coverage[map_coverage["매핑"] == "미매핑"]["열"].tolist()
+                    if unmapped:
+                        st.warning("매핑되지 않은 열: " + ", ".join(unmapped))
+
+        if not by_trt:
+            daily = preprocess.to_daily(clean, **daily_kwargs)
+
         st.subheader("① 일별 요약")
         n_bad_day = int((~daily["is_complete"]).sum()) if "is_complete" in daily else 0
-        st.caption(f"{len(daily)}일 · 불완전일 {n_bad_day}일 "
+        n_days = daily["date"].nunique() if "date" in daily else 0
+        st.caption(f"{n_days}일{f' × 처리구 {daily.trt.nunique()}개' if by_trt else ''} · "
+                   f"불완전 {n_bad_day}건 "
                    f"(레코드 완전성 {pcfg.get('daily_min_completeness', 0.9):.0%} 미만)")
         st.dataframe(daily, use_container_width=True, hide_index=True, height=240)
         df_download(daily, "일별 요약 CSV", "daily_env_summary.csv", "dl_daily")
@@ -296,9 +332,26 @@ with tab_pre:
             intervals = preprocess.build_intervals(
                 growth[date_col], first_start=pd.Timestamp(first_start),
                 lag_days=int(lag_days), window_days=int(window_days) if window_days else None)
-            env_interval = preprocess.aggregate_intervals(daily, intervals,
-                                                          drop_incomplete_days=drop_incomplete)
-            merged = preprocess.match_growth(growth, env_interval, date_col=date_col)
+
+            trt_col = None
+            if by_trt:
+                cand = [c for c in growth.columns if c != date_col]
+                trt_col = st.selectbox(
+                    "생육 자료의 처리구 열", cand,
+                    index=cand.index("trt") if "trt" in cand else 0,
+                    help="이 열의 값이 sensor_map.yaml 의 처리구명과 같아야 병합됩니다.")
+                env_interval = preprocess.aggregate_intervals_by_treatment(
+                    daily, intervals, drop_incomplete)
+                missing_trt = set(growth[trt_col].astype(str)) - set(env_interval["trt"].astype(str))
+                if missing_trt:
+                    st.error("매핑에 없는 생육 처리구: " + ", ".join(sorted(missing_trt)) +
+                             " → sensor_map.yaml 의 처리구명을 생육자료와 일치시키세요.")
+                merged = preprocess.match_growth(growth, env_interval,
+                                                 date_col=date_col, trt_col=trt_col)
+            else:
+                env_interval = preprocess.aggregate_intervals(daily, intervals,
+                                                              drop_incomplete_days=drop_incomplete)
+                merged = preprocess.match_growth(growth, env_interval, date_col=date_col)
 
             st.subheader("③ 구간 정의 (시차 매칭 결과)")
             st.dataframe(
@@ -331,6 +384,8 @@ with tab_pre:
                     excel_bytes({"daily_env_summary": daily, "interval_definition": intervals,
                                  "env_interval_summary": env_interval, "merged_env_growth": merged,
                                  "column_mapping": map_report,
+                                 "treatment_mapping": map_coverage if not map_coverage.empty
+                                 else pd.DataFrame({"note": ["처리구 매핑 미사용"]}),
                                  "out_of_range": range_report if not range_report.empty
                                  else pd.DataFrame({"note": ["없음"]})}),
                     file_name="preprocess_report.xlsx",

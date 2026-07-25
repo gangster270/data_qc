@@ -1,0 +1,97 @@
+# =====================================================================
+# 센서 ↔ 처리구 매핑
+#
+# 한 로거의 TEROS/SQ-521 이 서로 다른 처리구를 재는 현장 구성이므로,
+# 어느 포트가 어느 처리구인지 여기에 적어야 처리구별 환경 집계가 가능하다.
+#
+# 사용법
+#   1) TRT1, TRT2 ... 를 **생육자료의 처리구 이름과 똑같이** 바꾼다(예: NI, NI+SL).
+#      이름이 다르면 생육 자료와 병합되지 않는다(실행 시 경고가 뜬다).
+#   2) 오른쪽 값(vwc__rep1 등)은 건드리지 않는다. 파일에 실린 **포트 순서**를 따른다
+#      (rep1 = 파일에서 첫 번째로 나오는 해당 종류 센서 = 가장 낮은 포트번호).
+#   3) shared 는 처리구 공통 변수(구역에 하나뿐인 센서). 모든 처리구에 동일 적용된다.
+#   4) 적용:
+#        python scripts/run_preprocess.py --env "data/z6-20917_*.xlsx" \
+#               --growth data/growth.csv --by-treatment --out outputs/
+#      대시보드에서는 🔁 전처리 탭의 '처리구별 집계' 체크.
+#
+# 검증 방법: 대시보드에서 처리구별 배지수분·배지온도 곡선을 보고 관수·처리 시점과
+#           대조하면 포트↔처리구 대응이 맞는지 확인할 수 있다.
+# =====================================================================
+
+loggers:
+
+  # PPFD 전용 로거 — 처리구 구분 없음(구역 대표 광환경)
+  7구역-z6-21068:
+    zone: "7구역"
+    shared: [ppfd]
+    treatments: {}
+
+  # SQ-521 + PYR + ATMOS 14 + TEROS 12 ×3 (2026-01-30 ~)
+  z6-03959:
+    zone: ""                       # ← 온실·구역명 기입
+    shared: [temp, rh, ppfd, solar]
+    treatments:
+      TRT1:                        # ← Port 2 TEROS 의 처리구명
+        soil_temp: soil_temp__rep1
+        vwc: vwc__rep1
+        ec: ec__rep1
+      TRT2:                        # ← Port 3
+        soil_temp: soil_temp__rep2
+        vwc: vwc__rep2
+        ec: ec__rep2
+      TRT3:                        # ← Port 4
+        soil_temp: soil_temp__rep3
+        vwc: vwc__rep3
+        ec: ec__rep3
+
+  # PYR + ATMOS 14 + TEROS 12 ×1 — 배지센서 1조뿐이라 처리구 분리 불가.
+  # 이 로거의 배지환경을 특정 처리구에 붙이려면 treatments 에 그 처리구명 하나만 적는다.
+  z6-07680:
+    zone: ""
+    shared: [temp, rh, soil_temp, vwc, ec, solar]
+    treatments: {}
+
+  # SQ-521 ×2 + ATMOS 14 + TEROS 12 ×3 — 야간보광(NI/SL) 구역
+  #   ※ Port 2·3 TEROS 는 현재 미연결(전 구간 0). 복구 전까지 TRT1·TRT2 는 배지자료 없음.
+  #   ※ SQ-521 2개는 야간 광량이 크게 달라(23.5 vs 44.2 µmol) 서로 다른 위치다.
+  z6-20400:
+    zone: ""
+    shared: [temp, rh]
+    treatments:
+      TRT1:                        # ← Port 2 TEROS + Port 1 SQ-521
+        soil_temp: soil_temp__rep1
+        vwc: vwc__rep1
+        ec: ec__rep1
+        ppfd: ppfd__rep1
+      TRT2:                        # ← Port 3 TEROS + Port 5 SQ-521
+        soil_temp: soil_temp__rep2
+        vwc: vwc__rep2
+        ec: ec__rep2
+        ppfd: ppfd__rep2
+      TRT3:                        # ← Port 4 TEROS (전용 광센서 없음)
+        soil_temp: soil_temp__rep3
+        vwc: vwc__rep3
+        ec: ec__rep3
+
+  # TEROS 12 ×4 + PYR + SQ-521 (기온·습도 없음)
+  z6-20917:
+    zone: ""
+    shared: [ppfd, solar]
+    treatments:
+      TRT1:                        # ← Port 1
+        soil_temp: soil_temp__rep1
+        vwc: vwc__rep1
+        ec: ec__rep1
+      TRT2:                        # ← Port 2
+        soil_temp: soil_temp__rep2
+        vwc: vwc__rep2
+        ec: ec__rep2
+      TRT3:                        # ← Port 3
+        soil_temp: soil_temp__rep3
+        vwc: vwc__rep3
+        ec: ec__rep3
+      TRT4:                        # ← Port 4
+        soil_temp: soil_temp__rep4
+        vwc: vwc__rep4
+        ec: ec__rep4

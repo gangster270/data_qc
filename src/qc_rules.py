@@ -66,6 +66,18 @@ def _run_lengths(mask: pd.Series) -> list[tuple[int, int]]:
     return runs
 
 
+def sensor_columns(df: pd.DataFrame, var: str) -> list[str]:
+    """변수의 실제 센서 열 목록.
+
+    센서가 여러 개면 개별 열(var__rep1..N)을, 하나면 대표 열(var)을 돌려준다.
+    대표 열은 개별 열 중 하나의 복사본이므로 함께 세면 중복 집계가 된다.
+    """
+    reps = sorted(c for c in df.columns if c.startswith(f"{var}__rep"))
+    if reps:
+        return reps
+    return [var] if var in df.columns else []
+
+
 def _window(df: pd.DataFrame, lookback_days: int | None, now=None) -> pd.DataFrame:
     """최근 N일만 잘라낸다(과거 이슈 반복 알림 방지)."""
     if not lookback_days or df.empty:
@@ -210,9 +222,10 @@ def check_flatline(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) 
     ignore_zero = set(qc.get("flatline_ignore_zero", []))
     out = []
     for var, spec in cfg["sensors"].items():
-        # 대표 열뿐 아니라 중복 센서 열(var__rep2 …)도 점검한다.
-        # 미연결 포트는 '전 구간 0' 으로 나오므로 여기서 잡히지 않으면 조용히 묻힌다.
-        for col in [c for c in df.columns if c == var or c.startswith(f"{var}__rep")]:
+        # 센서가 여러 개면 개별 열(var__rep1..N)을 점검한다. 대표 열(var)은 그중
+        # 하나의 복사본이므로 중복 알림을 피하려 건너뛴다.
+        # 미연결 포트는 '전 구간 0' 으로 나오므로 여기서 잡지 않으면 조용히 묻힌다.
+        for col in sensor_columns(df, var):
             out.extend(_flatline_for_column(df, col, var, spec, qc, ignore_zero, interval))
     return out
 
@@ -453,14 +466,21 @@ def check_offline(df10: pd.DataFrame, cfg: dict, now=None) -> list[dict]:
 # R10 중복 센서 편차
 # ---------------------------------------------------------------------
 def check_pair_divergence(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=None) -> list[dict]:
-    """같은 환경에 설치된 동일 종류 센서(var, var__rep2 ...) 간 편차 점검."""
+    """같은 환경에 나란히 설치된 동일 종류 센서(var, var__rep2 ...) 간 편차 점검.
+
+    반복 센서가 서로 다른 처리구를 재는 현장에서는 편차가 정상이므로
+    `qc.pair_divergence_enabled: false` 로 꺼 둔다(기본값). 교정 목적으로
+    두 센서를 나란히 놓고 비교할 때만 켠다.
+    """
+    if not cfg["qc"].get("pair_divergence_enabled", False):
+        return []
     tol = cfg["qc"].get("pair_divergence", {})
     df = _window(df10, lookback_days, now)
     if df.empty:
         return []
     out = []
     for var, limit in tol.items():
-        cols = [c for c in df.columns if c == var or c.startswith(f"{var}__rep")]
+        cols = sensor_columns(df, var)
         if len(cols) < 2:
             continue
         base = df[cols[0]]

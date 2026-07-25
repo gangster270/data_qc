@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
         "rh_saturated_hours": 12,
         "offline_warn_minutes": 120,
         "offline_critical_minutes": 720,
+        "pair_divergence_enabled": False,
         "pair_divergence": {"temp": 1.0, "soil_temp": 1.0, "rh": 5.0, "vwc": 5.0, "ppfd": 0.15},
         "transmittance": {
             "enabled": True,

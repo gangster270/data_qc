@@ -152,6 +152,15 @@ python scripts/run_preprocess.py --env "data/z6-20917_*.xlsx" --growth data/grow
 python scripts/run_preprocess.py --env "data/*.xlsx" --replicate mean --out outputs/
 ```
 
+```bash
+# 로거 여러 대 일괄 처리 → 로거별 + 전체 통합 산출물
+python scripts/run_all_loggers.py --env "data/*.xlsx" --by-treatment --out outputs/all
+python scripts/run_all_loggers.py --env "data/*.xlsx" --growth data/growth.csv \
+       --by-treatment --first-start 2026-04-01 --out outputs/all
+```
+
+통합 산출물에는 `logger`·`trt` 열이 붙어, 로거·처리구를 한 파일에서 비교할 수 있다.
+
 생육 파일 형식은 `templates/growth_template.csv` 참조 (조사일 열 이름은 `--growth-date-col` 로 지정).
 
 ---

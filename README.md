@@ -42,6 +42,9 @@ python tests/test_pipeline.py           # 22/22 통과
 python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
        --first-start 2026-04-01 --out outputs/
 
+# 1-1) 로거 여러 대를 한 번에 (처리구별 집계 + 통합 파일)
+python scripts/run_all_loggers.py --env "data/*.xlsx" --by-treatment --out outputs/all
+
 # 2) 모니터링 — 최근 7일 결측·센서오류 점검 + 알림
 python scripts/run_monitor.py --env "data/*.xlsx" --lookback 7
 
@@ -175,6 +178,7 @@ src/alerts.py                  중복 억제, 리포트, 채널 발송
 src/sensor_check.py            검증 로그·기한·상호비교·드리프트
 src/sensor_map.py              센서↔처리구 매핑, 처리구 분리
 scripts/run_preprocess.py      전처리 CLI
+scripts/run_all_loggers.py     로거 일괄 전처리 + 통합 산출물
 scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭

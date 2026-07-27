@@ -561,8 +561,11 @@ with tab_result:
                                file_name="환경정리결과.xlsx", key="dl_xl2",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
-        next_step("내려받은 <code>생육_환경_병합.csv</code>(또는 <code>구간환경.csv</code>)를 "
-                  "R·엑셀에서 그대로 분석하면 됩니다.")
+        if merged is not None:
+            next_step("내려받은 <code>생육_환경_병합.csv</code> 를 R·엑셀에서 그대로 분석하면 됩니다.")
+        else:
+            next_step("내려받은 <code>구간환경.csv</code> 를 R·엑셀에서 그대로 분석하면 됩니다. "
+                      "생육 값까지 한 표로 붙이려면 위에서 <b>생육조사 파일 올리기</b>를 고르세요.")
 
     if survey_dates is not None and len(survey_dates) >= 1:
         first_start = st.date_input("첫 구간은 언제부터 계산할까요?", value=default_start,

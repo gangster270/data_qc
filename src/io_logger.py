@@ -17,6 +17,7 @@ METER ZL6 / ZENTRA Cloud export(.xlsx) 특유의 형식을 다룬다.
 
 from __future__ import annotations
 
+import csv
 import re
 from pathlib import Path
 
@@ -70,6 +71,9 @@ EXCLUDE_KEYWORDS = [
     "battery", "voltage", "reference pressure", "barometer", "atmospheric pressure",
 ]
 
+# 값이 아니라 행 번호인 열(HOBO 의 '#' 등)
+INDEX_COL_NAMES = {"#", "no", "no.", "번호", "index", "idx", "seq", "순번"}
+
 NAN_TOKENS = {"", "nan", "na", "n/a", "#n/a", "null", "none", "-"}
 HARD_ERROR_TOKENS = {
     "#value!", "#div/0!", "#ref!", "#name?", "#null!", "#num!",
@@ -87,16 +91,35 @@ LABELS = {
 # ---------------------------------------------------------------------
 # 1. 파일 읽기
 # ---------------------------------------------------------------------
-def _pick_sheet(sheet_names):
-    for s in sheet_names:
-        if "processed" in str(s).lower():
-            return s
-    non_meta = [s for s in sheet_names if "metadata" not in str(s).lower()]
-    return non_meta[0] if non_meta else sheet_names[0]
+def pick_sheets(sheet_names) -> list[str]:
+    """읽을 시트를 **모두** 고른다.
+
+    센서 구성이 바뀌면 로거가 `Processed Data Config 1`, `Config 2` … 처럼
+    시트를 나눠서 내보낸다. 한 시트만 읽으면 구성 변경 이후(또는 이전) 자료가
+    통째로 사라지므로 **같은 종류의 시트를 전부 읽어 합친다.**
+
+    우선순위: Processed(보정값) 전부 > Raw 전부 > Metadata 아닌 시트 전부.
+    (Processed 와 Raw 는 같은 자료의 두 표현이므로 절대 함께 읽지 않는다)
+    """
+    names = [str(s) for s in sheet_names]
+    processed = [s for s in names if "processed" in s.lower()]
+    if processed:
+        return processed
+    raw = [s for s in names if "raw" in s.lower()]
+    if raw:
+        return raw
+    non_meta = [s for s in names if "metadata" not in s.lower()]
+    return non_meta or names[:1]
+
+
+_HEADER_HINTS = ("timestamp", "일시", "datetime", "날짜", "date/time", "date time")
 
 
 def _detect_header_row(raw: pd.DataFrame, max_scan: int = 20) -> int:
-    """실제 변수명이 있는 헤더 행 번호를 찾는다(ZL6 는 보통 3행=index 2)."""
+    """실제 변수명이 있는 헤더 행 번호를 찾는다.
+
+    ZL6 는 3행(index 2), HOBO 는 2행(index 1)에 헤더가 있고 그 위에 메타행이 있다.
+    """
     keys = {k.lower() for k in TIMESTAMP_CANDIDATES}
     for i in range(min(max_scan, len(raw))):
         cells = [str(c).strip().lower() for c in raw.iloc[i].tolist() if c is not None]
@@ -104,17 +127,27 @@ def _detect_header_row(raw: pd.DataFrame, max_scan: int = 20) -> int:
             continue
         if any(c in keys for c in cells):
             return i
-        if any(("timestamp" in c) or ("일시" in c) or ("datetime" in c) for c in cells):
+        if any(any(h in c for h in _HEADER_HINTS) for c in cells):
             return i
     return 0
 
 
-def _build_unique_columns(header_cells) -> list[str]:
+def _build_unique_columns(header_cells, port_cells=None) -> list[str]:
+    """헤더 셀을 고유 열 이름으로 만든다.
+
+    port_cells(위쪽 'Port N' 행)가 있으면 **포트를 접두로 붙인다**.
+    센서 구성이 바뀌어 시트가 나뉘어도 포트 기준으로 열이 맞물려,
+    Config 1·2 를 합칠 때 다른 포트의 값이 한 열로 섞이지 않는다.
+    """
     columns, seen = [], {}
     for i, c in enumerate(header_cells):
         name = "" if c is None else str(c).strip()
         if name == "" or name.lower() == "nan":
             name = f"Unnamed_{i}"
+        if port_cells is not None and i < len(port_cells):
+            port = "" if port_cells[i] is None else str(port_cells[i]).strip()
+            if re.fullmatch(r"[Pp]ort\s*\d+", port) and name.lower() != "timestamp":
+                name = f"{port.replace(' ', '')} {name}".strip()
         if name in seen:
             seen[name] += 1
             name = f"{name}.{seen[name]}"
@@ -127,51 +160,171 @@ def _build_unique_columns(header_cells) -> list[str]:
 CSV_ENCODINGS = ["utf-8-sig", "cp949", "euc-kr", "utf-16", "latin1"]
 
 
-def _read_csv_any_encoding(source, sep=None):
-    """한글 로거 CSV(대개 CP949)까지 읽히도록 인코딩을 차례로 시도한다."""
-    last_err = None
+def _decode_text(source) -> str:
+    """파일/버퍼를 문자열로 읽는다(UTF-8·CP949·EUC-KR·UTF-16 순으로 시도)."""
+    if hasattr(source, "read"):
+        if hasattr(source, "seek"):
+            source.seek(0)
+        data = source.read()
+        if isinstance(data, str):
+            return data
+    else:
+        data = Path(source).read_bytes()
     for enc in CSV_ENCODINGS:
         try:
-            if hasattr(source, "seek"):
-                source.seek(0)
-            return pd.read_csv(source, header=None, sep=sep, dtype=object,
-                               encoding=enc, engine="python")
-        except (UnicodeDecodeError, UnicodeError) as e:
-            last_err = e
+            return data.decode(enc)
+        except (UnicodeDecodeError, UnicodeError):
             continue
-    if hasattr(source, "seek"):
-        source.seek(0)
-    return pd.read_csv(source, header=None, sep=sep, dtype=object,
-                       encoding_errors="replace", engine="python")
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_csv_any_encoding(source, sep=None) -> pd.DataFrame:
+    """구분자·인코딩·불규칙 행 길이를 모두 견디는 CSV 리더.
+
+    로거 CSV 는 상단에 필드 수가 다른 메타행이 섞여 있는 경우가 흔하다
+    (예: HOBO 의 `"차트 제목: 22094002"` 한 칸짜리 첫 행). pandas 기본 리더는
+    이런 파일에서 'Expected 1 fields' 로 실패하므로, 직접 파싱해 최대 열 수에
+    맞춰 채운다.
+    """
+    text = _decode_text(source)
+    lines = [ln for ln in text.splitlines() if ln.strip() != ""]
+    if not lines:
+        return pd.DataFrame()
+
+    if sep is None:                        # 앞부분에서 가장 많이 쓰인 구분자 추정
+        head = lines[:30]
+        counts = {d: sum(ln.count(d) for ln in head) for d in [",", ";", "\t", "|"]}
+        sep = max(counts, key=counts.get)
+        if counts[sep] == 0:
+            sep = ","
+
+    rows = list(csv.reader(lines, delimiter=sep))
+    width = max(len(r) for r in rows)
+    rows = [r + [None] * (width - len(r)) for r in rows]
+    return pd.DataFrame(rows, dtype=object)
+
+
+# 로거 일련번호(자체 센서 로거 번호)를 파일 안에서 찾는 패턴
+_SERIAL_PATTERNS = [
+    re.compile(r"차트\s*제목\s*[:：]\s*([\w\-]+)"),          # HOBO 한국어 export
+    re.compile(r"plot\s*title\s*[:：]\s*([\w\-]+)", re.I),   # HOBO 영문 export
+    re.compile(r"LGR\s*S/N\s*[:：]\s*([\w\-]+)", re.I),      # HOBO 헤더
+    re.compile(r"serial(?:\s*number)?\s*[:：]\s*([\w\-]+)", re.I),
+    re.compile(r"\b(z6-\d{4,6})\b", re.I),                   # METER ZL6
+]
+def _looks_like_date_token(tok: str) -> bool:
+    """`260703`(YYMMDD)·`20260703`(YYYYMMDD)처럼 내려받은 날짜로 보이는 토큰인가.
+
+    8자리 일련번호(22094002)가 날짜로 오인되지 않도록 월·일 범위까지 확인한다
+    (22-09-40 → 40일은 없으므로 날짜가 아니다).
+    """
+    if not tok.isdigit():
+        return False
+    if len(tok) == 6:
+        mm, dd = int(tok[2:4]), int(tok[4:6])
+    elif len(tok) == 8 and tok[:2] in ("19", "20"):
+        mm, dd = int(tok[4:6]), int(tok[6:8])
+    else:
+        return False
+    return 1 <= mm <= 12 and 1 <= dd <= 31
+
+
+def detect_serial_from_text(text: str) -> str | None:
+    """파일 상단 텍스트에서 로거 일련번호를 찾는다."""
+    for pat in _SERIAL_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def serial_from_filename(filename: str) -> str | None:
+    """파일명에서 로거 번호로 보이는 토큰을 고른다.
+
+    `260703_22094002.csv` 처럼 앞에 내려받은 날짜가 붙는 경우가 많다. 날짜로
+    보이는 토큰(YYMMDD·YYYYMMDD)은 건너뛰고, 남은 토큰 중 **숫자를 포함한
+    가장 긴 것**을 로거 번호로 본다(업로드 과정에서 붙는 해시 접두도 제거).
+    """
+    stem = Path(str(filename)).stem
+    stem = re.sub(r"^[0-9a-f]{6,}-", "", stem)            # 업로드 해시 접두 제거
+    tokens = [tok for tok in re.split(r"[_\s]+", stem) if tok]   # '-' 는 번호의 일부(z6-03959)
+
+    # ① 글자+숫자가 섞인 토큰(z6-03959, PAR1-22070169)이 있으면 그것이 로거 번호
+    named = [tok for tok in tokens if re.search(r"[A-Za-z가-힣]", tok) and re.search(r"\d{3,}", tok)]
+    if named:
+        return named[0]
+    # ② 숫자만이면 '내려받은 날짜'로 보이는 토큰을 빼고 첫 번째를 쓴다
+    numeric = [tok for tok in tokens if re.search(r"\d{4,}", tok) and not _looks_like_date_token(tok)]
+    if numeric:
+        return numeric[0]
+    # ③ 번호처럼 보이는 토큰이 없으면 첫 토큰을 식별자로 쓴다
+    #    (`구역A_1.xlsx`, `구역A_2.xlsx` 처럼 뒤에 회차만 붙는 이름도 한 로거로 묶이도록)
+    return (tokens[0] if tokens else stem) or None
+
+
+def _frame_from_raw(raw: pd.DataFrame, sheet: str | None = None) -> pd.DataFrame:
+    """헤더 행을 찾아 표를 정리한다(포트 접두 포함)."""
+    hrow = _detect_header_row(raw)
+    port_cells = raw.iloc[hrow - 2].tolist() if hrow >= 2 else None
+    columns = _build_unique_columns(raw.iloc[hrow].tolist(), port_cells)
+    df = raw.iloc[hrow + 1:].copy()
+    df.columns = columns
+    df = df.reset_index(drop=True).dropna(axis=1, how="all")
+    if sheet:
+        df["_sheet"] = sheet
+    return df
 
 
 def read_env_file(source, filename: str | None = None) -> pd.DataFrame:
     """단일 환경 로거 파일(.xlsx/.xls/.csv/.txt/.tsv)을 DataFrame 으로 읽는다.
 
     ZL6 전용이 아니다. 구분자·인코딩·헤더 위치를 자동 판별하므로 국산 로거·
-    자체 기록 파일도 그대로 읽힌다.
+    HOBO·자체 기록 파일도 그대로 읽힌다.
+
+    **엑셀은 시트를 모두 읽어 합친다.** 센서 구성이 바뀌면 로거가
+    `Processed Data Config 1`, `Config 2` … 로 시트를 나눠 내보내는데,
+    한 시트만 읽으면 나머지 기간이 통째로 사라진다. 열은 포트 기준으로
+    이름이 붙으므로 구성이 달라도 같은 포트끼리 이어진다.
     """
     name = filename or (Path(source).name if isinstance(source, (str, Path)) else "uploaded")
     suffix = Path(name).suffix.lower()
 
+    serial = None
     if suffix in (".csv", ".txt", ".tsv"):
         sep = "\t" if suffix == ".tsv" else None   # None → 구분자 자동 추론(, ; \t |)
         raw = _read_csv_any_encoding(source, sep=sep)
+        if raw.empty:
+            raise ValueError(f"{name}: 빈 파일")
+        head_text = " ".join(str(c) for c in raw.iloc[:3].to_numpy().ravel() if c is not None)
+        serial = detect_serial_from_text(head_text)
+        df = _frame_from_raw(raw)
     else:
         xls = pd.ExcelFile(source)
-        sheet = _pick_sheet(xls.sheet_names)
-        raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+        sheets = pick_sheets(xls.sheet_names)
+        frames = []
+        for sheet in sheets:
+            raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+            if raw.empty:
+                continue
+            part = _frame_from_raw(raw, sheet=sheet)
+            if len(part):
+                frames.append(part)
+        if not frames:
+            raise ValueError(f"{name}: 빈 파일")
+        first_raw = pd.read_excel(xls, sheet_name=sheets[0], header=None, dtype=object, nrows=3)
+        head_text = " ".join(str(c) for c in first_raw.to_numpy().ravel() if c is not None)
+        serial = detect_serial_from_text(head_text)
+        if serial is None:
+            a1 = str(first_raw.iloc[0, 0]).strip() if first_raw.shape[1] else ""
+            # 임의의 제목 텍스트를 번호로 오인하지 않도록, 숫자 4자리 이상 포함한
+            # 짧은 식별자일 때만 채택한다(예: 'z6-03959', 'A-10293').
+            if a1 and len(a1) <= 24 and re.search(r"\d{4,}", a1) and " " not in a1:
+                serial = a1
+        # 시트별 구성이 달라도 열의 합집합으로 이어붙인다(포트 기준 정렬)
+        df = pd.concat(frames, ignore_index=True, sort=False) if len(frames) > 1 else frames[0]
 
-    if raw.empty:
-        raise ValueError(f"{name}: 빈 파일")
-
-    hrow = _detect_header_row(raw)
-    columns = _build_unique_columns(raw.iloc[hrow].tolist())
-    df = raw.iloc[hrow + 1:].copy()
-    df.columns = columns
-    df = df.reset_index(drop=True)
-    df = df.dropna(axis=1, how="all")          # 완전 빈 포트 열 제거
     df["_source_file"] = name
+    df["_serial"] = serial or serial_from_filename(name) or Path(name).stem
     return df
 
 
@@ -202,8 +355,44 @@ def load_env_files(sources: list) -> tuple[pd.DataFrame, list[str]]:
 # ---------------------------------------------------------------------
 # 2. timestamp 처리
 # ---------------------------------------------------------------------
-_DATE_PAT = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}")
-_TIME_PAT = re.compile(r"\d{1,2}:\d{2}")
+# 날짜/시각 패턴 — 구분자 뒤 공백(`05. 19. 25`)과 한글 표기(`05시 30분`)까지 인식
+_DATE_PAT = re.compile(r"\d{4}[-/.]\s?\d{1,2}[-/.]\s?\d{1,2}|\d{1,2}[-/.]\s?\d{1,2}[-/.]\s?\d{2,4}|"
+                       r"\d{1,4}년\s?\d{1,2}월\s?\d{1,2}일")
+_TIME_PAT = re.compile(r"\d{1,2}:\d{2}|\d{1,2}시\s?\d{1,2}분")
+
+
+_KOREAN_DT_MAP = {"오전": "AM", "오후": "PM", "시": ":", "분": ":", "초": ""}
+_KOREAN_DT_FORMATS = ["%m.%d.%y%p%I:%M:%S", "%Y.%m.%d%p%I:%M:%S",
+                      "%m.%d.%Y%p%I:%M:%S", "%y.%m.%d%p%I:%M:%S"]
+
+
+def parse_datetime_series(series: pd.Series) -> pd.Series:
+    """시각 문자열을 datetime 으로 파싱한다(한글 표기 포함).
+
+    HOBO 한국어 export 는 `05. 19. 25 오후 05시 30분 01초` 형태로 내보내는데
+    pandas 가 그대로는 해석하지 못한다. 오전/오후·시·분·초를 치환해 파싱한다.
+    """
+    out = pd.to_datetime(series, errors="coerce")
+    if out.notna().mean() > 0.9:
+        return out
+
+    text = series.astype(str)
+    if not text.str.contains("오전|오후|시|분", regex=True).any():
+        return out
+
+    conv = text.str.strip()
+    for k, v in _KOREAN_DT_MAP.items():
+        conv = conv.str.replace(k, v, regex=False)
+    conv = conv.str.replace(r"\s+", "", regex=True).str.replace(":+", ":", regex=True)
+    conv = conv.str.rstrip(":")
+    best = out
+    for fmt in _KOREAN_DT_FORMATS:
+        cand = pd.to_datetime(conv, format=fmt, errors="coerce")
+        if cand.notna().mean() > (best.notna().mean() if best is not None else 0):
+            best = cand
+        if best.notna().mean() > 0.95:
+            break
+    return best
 
 
 def detect_interval_minutes(timestamps, default: float = 10.0) -> float:
@@ -304,7 +493,7 @@ def prepare_timestamp(df: pd.DataFrame, ts_col: str | None = None) -> tuple[pd.D
                     ts_col = None
 
     if ts_col is not None:
-        out["timestamp"] = pd.to_datetime(out[ts_col], errors="coerce")
+        out["timestamp"] = parse_datetime_series(out[ts_col])
         used_cols = [ts_col]
         source_desc = str(ts_col)
     else:
@@ -314,9 +503,8 @@ def prepare_timestamp(df: pd.DataFrame, ts_col: str | None = None) -> tuple[pd.D
                 "날짜/시간 열을 찾지 못했습니다. 파일 상단에 'Timestamp'·'일시'·'날짜'+'시간' "
                 "같은 열이 있는지 확인하거나, 대시보드에서 시간 열을 직접 지정하세요.")
         d_col, t_col = pair
-        out["timestamp"] = pd.to_datetime(
-            out[d_col].astype(str).str.strip() + " " + out[t_col].astype(str).str.strip(),
-            errors="coerce")
+        out["timestamp"] = parse_datetime_series(
+            out[d_col].astype(str).str.strip() + " " + out[t_col].astype(str).str.strip())
         used_cols = [d_col, t_col]
         source_desc = f"{d_col} + {t_col}"
 
@@ -379,6 +567,9 @@ def _match_variable(colname: str) -> str | None:
     return None
 
 
+META_COLS = {"timestamp", "_source_file", "_serial", "_sheet", "logger", "serial"}
+
+
 def map_columns(df: pd.DataFrame, overrides: dict[str, str] | None = None) -> dict[str, list[str]]:
     """원본 열 → 표준 변수키 매핑. 같은 변수의 중복 센서는 리스트로 모은다.
 
@@ -387,7 +578,7 @@ def map_columns(df: pd.DataFrame, overrides: dict[str, str] | None = None) -> di
     overrides = {str(k): str(v) for k, v in (overrides or {}).items()}
     mapping: dict[str, list[str]] = {}
     for col in df.columns:
-        if col in ("timestamp", "_source_file"):
+        if col in META_COLS:
             continue
         if str(col) in overrides:
             key = overrides[str(col)]
@@ -518,12 +709,12 @@ def standardize(df: pd.DataFrame, replicate: str = "first",
     if keep_unmapped:
         used_names = set(out.columns)
         for col in df.columns:
-            if col in ("timestamp", "_source_file") or col in mapped_sources:
+            if col in META_COLS or col in mapped_sources:
                 continue
             low = str(col).lower()
             if any(k in low for k in EXCLUDE_KEYWORDS):      # 배터리·로거내부온도 등
                 continue
-            if str(col).startswith("Unnamed_"):
+            if str(col).startswith("Unnamed_") or low.strip() in INDEX_COL_NAMES:
                 continue
             num, n_err = to_numeric_clean(df[col])
             if num.notna().sum() == 0:                       # 숫자가 아예 없는 열(메모 등)

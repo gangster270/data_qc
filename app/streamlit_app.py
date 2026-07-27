@@ -24,7 +24,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import alerts as alert_mod          # noqa: E402
-from src import archive, io_logger, preprocess, qc_rules, sensor_check, sensor_map   # noqa: E402
+from src import archive, io_logger, preprocess, qc_rules, registry, sensor_check, sensor_map   # noqa: E402
 from src.config import PROJECT_ROOT, load_config, resolve_path  # noqa: E402
 
 st.set_page_config(page_title="환경데이터 QC 대시보드", page_icon="🌱", layout="wide")
@@ -759,3 +759,40 @@ with tab_cfg:
 
     st.subheader("정기 검증 주기 / 허용오차")
     st.json(cfg["verification"], expanded=False)
+
+    # =================================================================
+    # 로거 번호 ↔ 구역 이름 (한 번 지정하면 계속 기억)
+    # =================================================================
+    st.divider()
+    st.subheader("🏷️ 로거 번호 ↔ 구역 이름")
+    st.caption("같은 센서 로거는 파일명이 매번 달라져도 **일련번호는 그대로**입니다. "
+               "여기서 구역 이름을 한 번 지정하면 이후 업로드부터 자동으로 같은 구역으로 묶입니다.")
+
+    reg = registry.load_registry()
+    table = registry.as_table(reg)
+    if table.empty:
+        st.info("아직 등록된 로거가 없습니다. 파일을 한 번 통합(build_archive)하면 자동 등록됩니다.")
+    else:
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        unnamed = [s for s, e in (reg.get("loggers") or {}).items()
+                   if not str((e or {}).get("zone", "")).strip()]
+        if unnamed:
+            st.warning(f"구역 미지정 {len(unnamed)}대: {', '.join(unnamed)} — 아래에서 이름을 지정하세요.")
+
+        z1, z2, z3 = st.columns([2, 2, 1])
+        pick_serial = z1.selectbox("로거 번호", list((reg.get("loggers") or {}).keys()), key="zone_serial")
+        cur = str(((reg.get("loggers") or {}).get(pick_serial) or {}).get("zone", ""))
+        new_zone = z2.text_input("구역 이름", value=cur, key="zone_name",
+                                 placeholder="예: 3구역, 1온실-A")
+        z3.write("")
+        if z3.button("저장", key="zone_save"):
+            registry.set_zone(reg, pick_serial, new_zone)
+            registry.save_registry(reg)
+            st.success(f"{pick_serial} → {new_zone or '(미지정)'} 저장. "
+                       f"다음 통합부터 이 이름으로 묶입니다.")
+            st.cache_data.clear()
+            st.rerun()
+
+        st.caption("여러 로거에 **같은 구역 이름**을 주면 한 구역으로 합쳐집니다"
+                   "(같은 시각의 값이 한 행으로 병합되고, 같은 변수는 `__rep2` 로 나뉘어 둘 다 보존).")
+        st.code('python scripts/build_archive.py --zone "22094002=7구역" --list-zones', language="bash")

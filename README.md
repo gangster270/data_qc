@@ -4,6 +4,12 @@
 **생육조사 간격(7일·10일)에 맞춰 시차 매칭**하고, **결측·센서오류를 자동 감시**하며,
 **센서 정기 검증 이력을 관리**하는 파이프라인.
 
+**같은 로거는 알아서 한 구역으로 묶인다.** 파일명이 매번 달라져도(`260703_22094002.csv`,
+`260710_22094002.csv`) 파일 안의 **로거 일련번호**를 읽어 같은 자료로 잇는다. 번호에 구역
+이름을 한 번 지정해 두면(`config/logger_registry.yaml`) 이후 업로드부터 자동 적용되고,
+한 구역에 로거가 여러 대면 **같은 시각의 값이 한 행으로 합쳐진다**(같은 변수는 `__rep`로 분리 보존).
+센서 구성이 바뀌어 엑셀 시트가 `Config 1`, `Config 2` 로 나뉘어도 전부 읽어 포트 기준으로 잇는다.
+
 **로거 기종을 가리지 않는다.** METER ZL6 뿐 아니라 국산 로거·자체 기록 파일도
 **시간(또는 날짜+시간) 열만 있으면** 그대로 처리된다 — 기록 간격(1·5·10·15·30·60분),
 구분자·인코딩(CP949 포함), 헤더 위치, 변수명 표기(`SoilTemp`/`배지 온도`/`Soil Temperature`)를
@@ -14,8 +20,9 @@
 ```
 로거 파일(.xlsx/.csv, 기종·간격 무관, 여러 대·여러 번)
    │
-   ├─▶ [통합 아카이브] 날짜순 정렬 · 변수 표준화 · 중복 정리 · 증분 업데이트
-   │                  scripts/build_archive.py · src/archive.py
+   ├─▶ [통합 아카이브] 로거번호 자동 인식 → **구역별로 병합** · 날짜순 정렬 ·
+   │                  변수 표준화 · 중복 정리 · 증분 업데이트
+   │                  scripts/build_archive.py · src/archive.py · src/registry.py
    │                  → env_master.csv (원자료) / env_master_clean.csv (QC 적용)
    │
    ├─▶ [전처리]  10분 → 일별 → 생육 구간(시차 매칭) → merged_env_growth.csv
@@ -40,10 +47,13 @@ pip install -r requirements.txt
 
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
-python tests/test_pipeline.py           # 25/25 통과
+python tests/test_pipeline.py           # 31/31 통과
 
 # 1) 통합 — 보유한 모든 환경데이터를 하나로 (새 파일 받으면 다시 실행만)
 python scripts/build_archive.py --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive
+
+# 1-a) 로거 번호에 구역 이름 지정 (한 번만; 이후 자동 기억)
+python scripts/build_archive.py --zone "22094002=3구역" --zone "z6-20917=3구역" --list-zones
 
 # 1-0) 전처리 — 환경 10분 → 생육 구간 매칭
 python scripts/run_preprocess.py --env "data/*.xlsx" --growth data/growth.csv \
@@ -181,20 +191,22 @@ streamlit run app/streamlit_app.py     # 터미널에 뜨는 http://localhost:85
 ```
 config/qc_config.yaml          임계값·알림·검증주기 (단일 설정 지점)
 config/sensor_map.yaml         포트 ↔ 처리구 매핑 (처리구별 집계용)
+config/logger_registry.yaml    로거 일련번호 ↔ 구역 이름 등록부 (자동 기억)
 src/io_logger.py               ZL6 형식 읽기, 열 표준화, 10분 격자 정합
 src/preprocess.py              일별·구간 집계, 시차 매칭, 범위 이탈 처리
 src/qc_rules.py                QC 규칙 13종 + 센서 상태표
 src/alerts.py                  중복 억제, 리포트, 채널 발송
 src/sensor_check.py            검증 로그·기한·상호비교·드리프트
 src/sensor_map.py              센서↔처리구 매핑, 처리구 분리
-src/archive.py                 전체 환경데이터 통합·정렬·증분 업데이트
+src/archive.py                 전체 환경데이터 통합·구역 병합·증분 업데이트
+src/registry.py                로거번호 ↔ 구역 등록부
 scripts/build_archive.py       전체 환경데이터 통합 아카이브 생성/갱신
 scripts/run_preprocess.py      전처리 CLI(조사일 직접 지정 가능)
 scripts/run_all_loggers.py     로거 일괄 전처리 + 통합 산출물
 scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
-tests/                         합성 자료 생성기 + 검증 테스트 25종
+tests/                         합성 자료 생성기 + 검증 테스트 31종
 docs/dashboard_guide.md        대시보드 사용법(설치·화면별 안내)
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식

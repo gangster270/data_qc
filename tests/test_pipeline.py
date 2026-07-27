@@ -465,7 +465,7 @@ def test_archive_build_merge_and_update(tmp_path=None):
         out = tmp / "archive"
 
         res = archive.build_archive([str(tmp / "logA_1.xlsx"), str(tmp / "logB_1.xlsx")],
-                                    CFG, out, update=False)
+                                    CFG, out, update=False, registry_path=tmp / "registry.yaml")
         master = res["master"]
         assert set(master["logger"]) == {"logA", "logB"}
         assert len(master) == 144 + 24
@@ -473,15 +473,17 @@ def test_archive_build_merge_and_update(tmp_path=None):
         assert master.sort_values(["logger", "timestamp"]).equals(master)
         assert {"temp", "rh"} <= set(master.columns)
         # 로거마다 기록 간격이 달라도 각각 맞게 격자 정합된다
-        assert res["summary"].set_index("로거").loc["logB", "기록간격(분)"] == 60
+        assert res["summary"].set_index("구역").loc["logB", "기록간격(분)"] == 60
 
         # 같은 파일을 다시 넣어도 행이 늘지 않는다(중복 병합)
-        res2 = archive.build_archive([str(tmp / "logA_1.xlsx")], CFG, out, update=True)
+        res2 = archive.build_archive([str(tmp / "logA_1.xlsx")], CFG, out, update=True,
+                                     registry_path=tmp / "registry.yaml")
         assert len(res2["master"]) == len(master)
 
         # 이어지는 기간의 새 파일은 추가된다
         _write_logger_file(tmp / "logA_2.xlsx", "2026-05-02", 144, "10min")
-        res3 = archive.build_archive([str(tmp / "logA_2.xlsx")], CFG, out, update=True)
+        res3 = archive.build_archive([str(tmp / "logA_2.xlsx")], CFG, out, update=True,
+                                     registry_path=tmp / "registry.yaml")
         assert len(res3["master"]) == len(master) + 144
         assert res3["master"]["timestamp"].max().strftime("%m-%d") == "05-02"
 
@@ -503,13 +505,155 @@ def test_archive_mixed_intervals_daily():
         _write_logger_file(tmp / "tenmin_1.xlsx", "2026-05-01", 144 * 2, "10min")
         _write_logger_file(tmp / "hourly_1.xlsx", "2026-05-01", 24 * 2, "1h")
         res = archive.build_archive([str(tmp / "tenmin_1.xlsx"), str(tmp / "hourly_1.xlsx")],
-                                    CFG, tmp / "arc", update=False)
+                                    CFG, tmp / "arc", update=False, registry_path=tmp / "registry.yaml")
         expected = {}
         for logger_id, df in archive.iter_loggers(res["master"]):
             daily = preprocess.to_daily(df)                    # 간격 자동 추정
             expected[logger_id] = int(daily["expected_records"].iloc[0])
         assert expected == {"tenmin": 144, "hourly": 24}
     print("✓ 간격이 다른 로거 혼재 아카이브")
+
+
+# ---------------------------------------------------------------------
+# 로거 번호 인식 · 구역 묶기 · 다중 시트
+# ---------------------------------------------------------------------
+def test_serial_detection_from_filename():
+    """파일명 앞에 내려받은 날짜가 붙어도 로거 번호를 골라낸다."""
+    cases = {
+        "260703_22094002.csv": "22094002",          # 날짜_번호
+        "20260703_22094002.csv": "22094002",
+        "a1b2c3d4-260703_22061061.csv": "22061061",  # 업로드 해시 접두
+        "z6-03959_086260946.xlsx": "z6-03959",
+    }
+    for name, expected in cases.items():
+        assert io_logger.serial_from_filename(name) == expected, name
+    # 날짜 토큰만 있으면 파일명 전체를 식별자로
+    assert io_logger.serial_from_filename("260703.csv") == "260703"     # 날짜뿐이면 파일명 그대로
+    print("✓ 파일명에서 로거 번호 인식(날짜 접두 무시)")
+
+
+def test_serial_detection_from_content():
+    """파일 안의 표기(HOBO 차트 제목·LGR S/N, ZL6 헤더)에서 번호를 찾는다."""
+    assert io_logger.detect_serial_from_text('"차트 제목: 22094002"') == "22094002"
+    assert io_logger.detect_serial_from_text("Plot Title: 22094002") == "22094002"
+    assert io_logger.detect_serial_from_text("PAR (LGR S/N: 22070169, SEN S/N: 1)") == "22070169"
+    assert io_logger.detect_serial_from_text("z6-03959 Port 1 Records: 100") == "z6-03959"
+    assert io_logger.detect_serial_from_text("수경재배 모니터") is None      # 임의 제목은 무시
+    print("✓ 파일 내용에서 로거 번호 인식")
+
+
+def test_korean_hobo_datetime():
+    """HOBO 한국어 시각(`05. 19. 25 오후 05시 30분 01초`)을 파싱한다."""
+    s = pd.Series(["05. 19. 25 오후 05시 30분 01초",
+                   "05. 19. 25 오후 05시 40분 01초",
+                   "05. 20. 25 오전 09시 00분 01초"])
+    out = io_logger.parse_datetime_series(s)
+    assert out.notna().all()
+    assert out.iloc[0].strftime("%Y-%m-%d %H:%M") == "2025-05-19 17:30"
+    assert out.iloc[2].strftime("%Y-%m-%d %H:%M") == "2025-05-20 09:00"
+    print("✓ HOBO 한국어 시각 파싱")
+
+
+def test_multi_sheet_excel(tmp_path=None):
+    """센서 구성이 바뀌어 시트가 나뉜 엑셀도 전부 읽어 합친다."""
+    import tempfile
+    ts1 = pd.date_range("2026-05-01", periods=144, freq="10min")
+    ts2 = pd.date_range("2026-05-02", periods=144, freq="10min")
+    cfg1 = pd.DataFrame([["z6-99999", "Port 1", "Port 2"],
+                         ["Records: 144", "SQ-521", "ATMOS 14"],
+                         ["Timestamp", " µmol PPFD", " °C Air Temperature"]] +
+                        [[t, 100.0, 20.0] for t in ts1])
+    # Config 2 에서 포트 구성이 바뀜(PPFD 제거, TEROS 추가)
+    cfg2 = pd.DataFrame([["z6-99999", "Port 2", "Port 3"],
+                         ["Records: 144", "ATMOS 14", "TEROS 12"],
+                         ["Timestamp", " °C Air Temperature", "% Water Content"]] +
+                        [[t, 25.0, 30.0] for t in ts2])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "z6-99999_260703.xlsx"
+        with pd.ExcelWriter(path) as w:
+            cfg1.to_excel(w, sheet_name="Processed Data Config 1", index=False, header=False)
+            cfg2.to_excel(w, sheet_name="Processed Data Config 2", index=False, header=False)
+            cfg1.to_excel(w, sheet_name="Raw Data Config 1", index=False, header=False)
+            pd.DataFrame([["meta"]]).to_excel(w, sheet_name="Metadata", index=False, header=False)
+
+        assert io_logger.pick_sheets(["Processed Data Config 1", "Processed Data Config 2",
+                                      "Raw Data Config 1", "Metadata"]) == \
+            ["Processed Data Config 1", "Processed Data Config 2"]
+
+        df = io_logger.read_env_file(path)
+        assert len(df) == 288                        # 두 Config 가 모두 들어옴(Raw 중복 없음)
+        out, rep = io_logger.prepare_timestamp(df)
+        std, _ = io_logger.standardize(out)
+        # 같은 포트(Port 2 기온)는 한 열로 이어지고, 구성이 다른 변수는 각자 남는다
+        assert std["temp"].notna().sum() == 288
+        assert std["ppfd"].notna().sum() == 144
+        assert std["vwc"].notna().sum() == 144
+        assert rep["duplicate_rows"] == 0
+    print("✓ 다중 시트(Config 1·2) 병합")
+
+
+def test_zone_grouping_and_memory():
+    """같은 번호는 계속 같은 구역으로, 한 구역의 로거 여러 대는 한 자료로 묶인다."""
+    import tempfile
+    from src import archive, registry
+
+    def _hobo(path, serial, start, periods=144):
+        ts = pd.date_range(start, periods=periods, freq="10min") + pd.Timedelta(seconds=1)
+        pd.DataFrame({"Timestamp": ts,
+                      f"PAR, µmol/m²/s (LGR S/N: {serial})": np.linspace(0, 900, periods)}
+                     ).to_csv(path, index=False, encoding="utf-8-sig")
+
+    def _zl6(path, serial, start, periods=144):
+        ts = pd.date_range(start, periods=periods, freq="10min")
+        pd.DataFrame({"Timestamp": ts,
+                      " °C Air Temperature": np.linspace(18, 25, periods),
+                      "% Relative Humidity": np.linspace(60, 70, periods)}
+                     ).to_excel(path, index=False)
+        return serial
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        reg_path = tmp / "registry.yaml"
+        _hobo(tmp / "260703_22094002.csv", "22094002", "2026-05-01")
+        _zl6(tmp / "z6-11111_260703.xlsx", "z6-11111", "2026-05-01")
+
+        cfgd = {**CFG, "sensors": CFG["sensors"]}
+        reg = registry.load_registry(reg_path)
+        registry.set_zone(reg, "22094002", "3구역")
+        registry.set_zone(reg, "z6-11111", "3구역")     # 같은 구역에 로거 2대
+        registry.save_registry(reg, reg_path)
+
+        res = archive.build_archive([str(tmp / "260703_22094002.csv"), str(tmp / "z6-11111_260703.xlsx")],
+                                    cfgd, tmp / "arc", update=False, registry_path=reg_path)
+        master = res["master"]
+        assert set(master["logger"]) == {"3구역"}          # 두 로거가 한 구역으로
+        assert len(master) == 144                          # 시각이 격자에 맞춰져 한 행으로 병합
+        assert {"ppfd", "temp", "rh"} <= set(master.columns)
+        assert master["serial"].str.contains(r"\+").all()  # 한 행에 두 로거가 기여
+
+        # 다음 업로드(파일명이 달라도) 같은 번호 → 같은 구역, 기존 자료에 이어붙음
+        _hobo(tmp / "260710_22094002.csv", "22094002", "2026-05-02")
+        res2 = archive.build_archive([str(tmp / "260710_22094002.csv")], cfgd, tmp / "arc",
+                                     update=True, registry_path=reg_path)
+        assert set(res2["master"]["logger"]) == {"3구역"}
+        assert len(res2["master"]) == 288
+        print("✓ 구역 이름 기억 · 로거 여러 대 한 구역 병합")
+
+
+def test_zone_column_collision():
+    """한 구역의 두 로거가 같은 변수를 재면 둘 다 보존한다(__rep 로 분리)."""
+    from src import archive
+    ts = pd.date_range("2026-05-01", periods=10, freq="10min")
+    a = pd.DataFrame({"logger": "3구역", "serial": "A", "timestamp": ts, "ppfd": 100.0})
+    b = pd.DataFrame({"logger": "3구역", "serial": "B", "timestamp": ts,
+                      "ppfd": 200.0, "ppfd__rep1": 210.0, "ppfd__rep2": 220.0})
+    frames, notes = archive.resolve_zone_collisions([a, b])
+    merged = archive.merge_frames(frames)
+    assert len(merged) == 10                                  # 시각 기준 한 행
+    assert merged["ppfd"].eq(100.0).all()                     # 먼저 온 로거가 기본 이름 유지
+    assert (merged["ppfd__rep3"] == 200.0).all()              # 뒤 로거는 새 이름으로 보존
+    assert not notes.empty
+    print("✓ 구역 내 동일 변수 열 분리 보존")
 
 
 def test_judge_tolerance():

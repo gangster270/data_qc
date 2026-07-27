@@ -35,7 +35,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src import archive                              # noqa: E402
+from src import archive, registry                    # noqa: E402
 from src.config import load_config                   # noqa: E402
 
 DEFAULT_PATTERNS = ["data/**/*.xlsx", "data/**/*.xls", "data/**/*.csv", "data/**/*.txt"]
@@ -65,25 +65,48 @@ def main() -> int:
     ap.add_argument("--replicate", choices=["first", "mean", "keep"], default="first")
     ap.add_argument("--rebuild", action="store_true",
                     help="기존 마스터를 무시하고 처음부터 다시 만든다")
+    ap.add_argument("--zone", action="append", default=[], metavar="번호=구역명",
+                    help='로거 번호에 구역 이름 지정(반복 가능). 예: --zone "22094002=3구역"')
+    ap.add_argument("--list-zones", action="store_true", help="등록된 로거·구역 목록만 출력")
+    ap.add_argument("--registry", default=None, help="등록부 경로(기본 config/logger_registry.yaml)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+
+    # --- 구역 이름 지정/조회 (한 번 지정하면 계속 기억된다) ---------------
+    if args.zone:
+        reg = registry.load_registry(args.registry)
+        for item in args.zone:
+            if "=" not in item:
+                print(f"형식 오류: --zone \"번호=구역명\" 로 지정하세요 (입력: {item})", file=sys.stderr)
+                return 2
+            serial, zone = item.split("=", 1)
+            registry.set_zone(reg, serial.strip(), zone.strip())
+            print(f"구역 지정: {serial.strip()} → {zone.strip()}")
+        registry.save_registry(reg, args.registry)
+
+    if args.list_zones:
+        reg = registry.load_registry(args.registry)
+        table = registry.as_table(reg)
+        print(table.to_string(index=False) if len(table) else "등록된 로거가 없습니다.")
+        return 0
+
     paths = expand(args.env)
     if not paths:
         print(f"파일을 찾지 못했습니다: {' '.join(args.env)}", file=sys.stderr)
         return 2
 
     print(f"[1/3] 파일 {len(paths)}개 읽는 중...")
-    res = archive.build_archive(paths, cfg, args.out,
-                                replicate=args.replicate, update=not args.rebuild)
+    res = archive.build_archive(paths, cfg, args.out, replicate=args.replicate,
+                                update=not args.rebuild, registry_path=args.registry)
     for line in res["log"]:
         print("   ", line)
 
     master, clean, summary = res["master"], res["clean"], res["summary"]
     print(f"\n[2/3] 통합 마스터 {len(master):,}행 · 로거 {master['logger'].nunique()}대 · "
           f"변수 {len([c for c in master.columns if c not in ('logger', 'timestamp')])}종")
-    print(summary[["로거", "시작", "종료", "기간(일)", "관측행", "기록간격(분)",
-                   "결측ts", "변수수"]].to_string(index=False))
+    print(summary[["구역", "로거번호", "시작", "종료", "기간(일)", "관측행",
+                   "기록간격(분)", "결측ts", "변수수"]].to_string(index=False))
 
     if not res["range_report"].empty:
         print("\n    범위 이탈값 결측 처리:")
@@ -95,6 +118,10 @@ def main() -> int:
     with pd.ExcelWriter(xlsx, engine="openpyxl") as w:
         summary.to_excel(w, sheet_name="logger_summary", index=False)
         res["files"].to_excel(w, sheet_name="files", index=False)
+        registry.as_table(res["registry"]).to_excel(w, sheet_name="logger_registry", index=False)
+        (res["collisions"] if not res["collisions"].empty
+         else pd.DataFrame({"note": ["구역 내 열 충돌 없음"]})).to_excel(
+            w, sheet_name="zone_collisions", index=False)
         (res["range_report"] if not res["range_report"].empty
          else pd.DataFrame({"note": ["범위 이탈값 없음"]})).to_excel(
             w, sheet_name="out_of_range", index=False)
@@ -107,6 +134,12 @@ def main() -> int:
     print(f"    → {out / archive.MASTER_NAME}  (원자료 통합)")
     print(f"    → {out / archive.CLEAN_NAME}  (QC 적용, 분석·모니터링용)")
     print(f"    → {xlsx}")
+    unnamed = [s for s, e in (res["registry"].get("loggers") or {}).items()
+               if not str((e or {}).get("zone", "")).strip()]
+    if unnamed:
+        print(f"\n⚠ 구역 이름이 지정되지 않은 로거 {len(unnamed)}대: {', '.join(unnamed)}")
+        print(f'   지정: python scripts/build_archive.py --zone "{unnamed[0]}=1구역" --list-zones')
+
     print("\n다음 단계:")
     print(f"  모니터링   python scripts/run_monitor.py --archive {out} --by-logger")
     print(f"  시차 매칭  python scripts/run_preprocess.py --archive {out} "

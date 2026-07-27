@@ -228,10 +228,14 @@ def check_missing_ratio(df10: pd.DataFrame, cfg: dict, lookback_days=None, now=N
     out = []
     for var in value_columns(df):
         # 관측기간 내내 비어 있는 변수(미설치)는 결측 알림 대상에서 제외
-        if df[var].notna().sum() == 0:
+        valid = df.loc[df[var].notna(), "timestamp"]
+        if valid.empty:
             continue
+        # 센서마다 설치·철거 시점이 다르다(한 구역에 로거를 나중에 추가하는 경우 등).
+        # 첫 관측 이전·마지막 관측 이후는 '아직 없던 센서'이므로 결측으로 보지 않는다.
+        first_day, last_day = valid.min().date(), valid.max().date()
         for date, g in df.groupby("date"):
-            if date not in evaluable:
+            if date not in evaluable or date < first_day or date > last_day:
                 continue
             ratio = 1 - g[var].notna().sum() / expected
             if ratio >= qc["missing_critical_ratio"]:

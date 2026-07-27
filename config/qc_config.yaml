@@ -1,0 +1,148 @@
+# =====================================================================
+# 환경데이터 QC · 모니터링 설정
+#   - 이 파일 하나로 임계값 / 알림채널 / 전처리 규칙을 관리한다.
+#   - 비밀값(웹훅 URL, SMTP 비밀번호)은 여기 쓰지 말고 환경변수로 넘긴다.
+# =====================================================================
+
+site:
+  name: "시설재배 실증포장"
+  timezone: "Asia/Seoul"
+  # 기록 간격(분). "auto" 면 자료의 timestamp 에서 자동 추정한다.
+  #   1·5·10·15·30·60분 어느 로거든 그대로 처리되며, DLI·완전성·고착 판정에 반영된다.
+  #   특정 값으로 고정하려면 숫자를 적는다(예: 10).
+  interval_minutes: auto
+
+# ---------------------------------------------------------------------
+# 1. 전처리(환경 → 생육 구간 집계) 규칙
+# ---------------------------------------------------------------------
+preprocess:
+  gdd_base: 10.0                # 적산온도 기준온도(작물별 조정: 들깨·엽채류 10℃)
+  daily_min_completeness: 0.90  # 하루 유효 레코드 비율이 이 값 미만이면 불완전일로 표시
+  drop_incomplete_days: false   # true 면 불완전일을 구간 집계에서 제외
+  photoperiod_ppfd_threshold: 10   # 광주기(시간) 판정 PPFD 하한 (µmol m-2 s-1)
+  daytime_hours: [9, 15]        # 주간 대표시간대(VPD_day, 주간평균 계산 구간)
+  lag_days: 0                   # 시차(일). 환경 구간을 생육 측정일 기준 N일 앞당김
+  window_days: null             # null 이면 '직전 측정일 다음날~당일' 가변구간, 숫자면 고정창
+
+# ---------------------------------------------------------------------
+# 2. 센서 물리 범위 (out-of-range 판정)
+#    min/max      : 이 범위를 벗어나면 오류값으로 간주
+#    flat_minutes : 같은 값이 이 시간(분)만큼 연속되면 고착(flatline) 의심
+#                   (횟수가 아니라 시간 기준 → 기록 간격이 달라도 기준이 유지된다)
+#    spike        : 10분당 변화량 기준. 다른 간격 자료에는 자동 환산된다.
+#    ※ 여기 없는 변수(CO2·풍속·수온·pH 등)도 자동 보존되며, 범위 판정만 생략하고
+#      결측·고착 규칙은 동일하게 적용된다. 임계값을 주고 싶으면 여기에 추가한다.
+# ---------------------------------------------------------------------
+#    ※ 범위는 '센서 측정사양' 기준으로 넓게 잡는다. 작물 기준으로 좁게 잡으면
+#      실제 고온사고(예: 환기 실패로 70℃) 같은 진짜 사건이 오류로 지워진다.
+#      작물 위험 수준은 별도 규칙(heat_event)으로 경보한다.
+sensors:
+  temp:        {label: "온도",     unit: "℃",             min: -40,  max: 80,    flat_minutes: 360, spike: 5.0}
+  rh:          {label: "습도",     unit: "%",              min: 0,    max: 100,   flat_minutes: 360, spike: 30.0}
+  soil_temp:   {label: "배지온도", unit: "℃",             min: -40,  max: 60,    flat_minutes: 720, spike: 4.0}
+  # METER TEROS 는 '% Water Content'(체적수분 ×100)로 내보낸다. m³/m³ 가 아니라 % 단위.
+  vwc:         {label: "배지습도", unit: "%",              min: 0.0,  max: 75.0,  flat_minutes: 720, spike: 15.0}
+  ppfd:        {label: "PPFD",     unit: "µmol m-2 s-1",   min: 0,    max: 2500,  flat_minutes: 180, spike: 1500}
+  solar:       {label: "일사량",   unit: "W/m²",           min: 0,    max: 1400,  flat_minutes: 180, spike: 800}
+  ec:          {label: "EC",       unit: "mS/cm",          min: 0.0,  max: 20.0,  flat_minutes: 720, spike: 3.0}
+  co2:         {label: "CO2",      unit: "ppm",            min: 250,  max: 3000,  flat_minutes: 360, spike: 500}
+
+# ---------------------------------------------------------------------
+# 3. QC 규칙별 임계값 / 심각도
+# ---------------------------------------------------------------------
+qc:
+  # 결측 timestamp: 연속 결측 구간(분) 기준
+  gap_warn_minutes: 60          # 1시간 이상 끊기면 WARN
+  gap_critical_minutes: 360     # 6시간 이상 끊기면 CRITICAL
+
+  # 일별 변수 결측률
+  missing_warn_ratio: 0.10
+  missing_critical_ratio: 0.50
+
+  # 고착(flatline) — sensors.flat_n 회 연속 동일값
+  flatline_enabled: true
+  # 0 연속이 정상인 변수: 광(야간), EC(배지 건조 시 TEROS 가 0 출력 — 고장 아님)
+  flatline_ignore_zero: [ppfd, solar, ec]
+  flatline_light_floor: 10              # 광센서는 이 값 이하(박명·야간)의 동일값도 정상으로 본다
+
+  # 급변(spike)
+  spike_enabled: true
+  spike_warn_count: 3           # 하루 spike 발생 N회 이상이면 알림
+
+  # 주간 암흑(광센서 탈락/차폐): daytime_hours 중 PPFD 최대값이 이 값 미만
+  daytime_dark_ppfd_max: 20
+
+  # 야간 광 검출: night_hours 중 PPFD 가 이 값 초과
+  #   ※ 야간보광(NI/SL) 처리구는 정상적으로 야간 광이 있으므로 반드시 제외할 것
+  night_light_ppfd: 5
+  night_hours: [23, 3]          # 23시~익일 3시 (보광 시간대와 겹치지 않게 설정)
+  night_light_enabled: false    # NI/SL 시험 중이면 false 유지
+
+  # 작물 고온 경보(센서 범위와 별개 — 값은 유효하지만 작물에 위험한 수준)
+  heat_event_temp: 45           # 일최고 기온이 이 값을 넘은 날
+  heat_event_soil_temp: 40      # 일최고 배지온도
+
+  # 습도 포화 지속(결로/센서 고장)
+  rh_saturated_hours: 12        # RH ≥ 99% 가 이 시간 이상 연속
+
+  # 로거 통신 두절: 마지막 관측이 N분 이상 과거
+  offline_warn_minutes: 120
+  offline_critical_minutes: 720
+
+  # 중복 센서 편차(같은 환경에 나란히 설치된 동일 종류 센서 간)
+  #   ※ 본 현장은 한 로거의 반복 센서가 서로 다른 처리구를 재므로 기본 비활성.
+  #     (처리구가 다르면 편차는 정상이며, 경보는 전부 오탐이 된다)
+  #     교정 목적으로 두 센서를 나란히 놓고 비교할 때만 true 로 켠다.
+  pair_divergence_enabled: false
+  pair_divergence:
+    temp:      1.0     # ℃
+    soil_temp: 1.0     # ℃
+    rh:        5.0     # %
+    vwc:       5.0     # % (METER TEROS 는 % 단위 출력)
+    ppfd:      0.15    # 상대편차 15%
+
+  # 투과율(내부 PPFD / 외부 일사환산 PPFD) 급락 → 센서 오염·차광막
+  transmittance:
+    enabled: true
+    solar_to_ppfd_factor: 2.057   # 개방광 기준. 현장 교차검증값이 있으면 교체(예: 1.42)
+    drop_ratio: 0.70              # 최근 중앙값이 기준 중앙값의 70% 미만이면 알림
+    baseline_days: 30
+    recent_days: 3
+
+# ---------------------------------------------------------------------
+# 4. 알림 설정
+#    secrets 는 환경변수로: SLACK_WEBHOOK_URL, SMTP_HOST/PORT/USER/PASSWORD
+# ---------------------------------------------------------------------
+alerts:
+  min_level: "WARN"             # INFO | WARN | CRITICAL — 이 등급 이상만 발송
+  cooldown_hours: 12            # 같은 알림 재발송 억제 시간
+  state_file: "outputs/alert_state.json"
+  report_dir: "outputs/reports"
+  channels:
+    console: true
+    file: true                  # outputs/reports/alerts_YYYY-MM-DD.jsonl
+    slack: false                # SLACK_WEBHOOK_URL 설정 후 true
+    email: false                # SMTP_* 설정 후 true
+  email:
+    sender: "noreply@example.org"
+    recipients: []              # ["duce270@gmail.com"]
+    subject_prefix: "[환경데이터 QC]"
+
+# ---------------------------------------------------------------------
+# 5. 센서 정기 검증 루틴 주기(일). docs/sensor_verification_routine.md 참조
+# ---------------------------------------------------------------------
+verification:
+  log_file: "outputs/sensor_verification_log.csv"
+  schedule_days:
+    visual_check: 7        # 육안 점검·청소
+    cross_check: 30        # 센서 상호비교(24h 나란히 설치)
+    reference_check: 90    # 기준기 대조 / EC 표준액
+    factory_calibration: 730   # 제조사 재교정(2년)
+  tolerance:               # 검증 합격 기준(절대편차)
+    temp: 0.5
+    rh: 3.0
+    soil_temp: 0.5
+    vwc: 3.0               # % 단위(TEROS 출력 기준). m³/m³ 로 환산 시 0.03
+    ec: 0.3
+    ppfd_rel: 0.05         # 상대편차 5%
+    solar_rel: 0.05

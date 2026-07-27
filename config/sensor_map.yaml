@@ -1,0 +1,103 @@
+# =====================================================================
+# 센서 ↔ 처리구 매핑
+#
+# 한 로거의 TEROS/SQ-521 이 서로 다른 처리구를 재는 구성이므로,
+# 어느 포트가 어느 처리구인지 여기에 적어야 처리구별 환경 집계가 가능하다.
+#
+# ▶ 현재 상태: 처리구명을 **포트 기준 식별자**(z6-20917-P1 등)로 채워 두었다.
+#   실제 시험 처리구명(NI, NI+SL, 대조구 …)을 아는 사람이 아래 키만 바꾸면 된다.
+#   키 이름은 **생육자료의 처리구 값과 정확히 같아야** 병합된다.
+#
+#   예)  z6-20917-P1:  →  NI:
+#        z6-20917-P2:  →  NI+SL:
+#
+# ▶ 오른쪽 값(vwc__rep1 등)은 건드리지 않는다. 파일에 실린 **포트 순서**를 따른다
+#   (rep1 = 해당 종류 센서 중 가장 낮은 포트번호).
+# ▶ shared 는 처리구 공통 변수(구역에 하나뿐인 센서) — 모든 처리구에 동일 적용.
+#
+# ▶ 검증 방법: 처리구별 배지수분 곡선을 관수·처리 시점과 대조하면 포트↔처리구
+#   대응이 맞는지 확인할 수 있다. 아래 각 슬롯의 실측 특성을 참고할 것.
+# =====================================================================
+
+loggers:
+
+  # PPFD 전용 — 처리구 구분 없음(구역 대표 광환경). 주간 중앙 152 µmol, 야간 광 없음
+  7구역-z6-21068:
+    zone: "7구역"
+    shared: [ppfd]
+    treatments: {}
+
+  # SQ-521 + PYR + ATMOS 14 + TEROS 12 ×3 (2026-01-30 ~), 야간 광 없음
+  z6-03959:
+    zone: ""                       # ← 온실·구역명 기입
+    shared: [temp, rh, ppfd, solar]
+    treatments:
+      z6-03959-P2:                 # Port 2 | 배지수분 평균 21.3%, EC 0.28
+        soil_temp: soil_temp__rep1
+        vwc: vwc__rep1
+        ec: ec__rep1
+      z6-03959-P3:                 # Port 3 | 배지수분 21.0%, EC 0.53
+        soil_temp: soil_temp__rep2
+        vwc: vwc__rep2
+        ec: ec__rep2
+      z6-03959-P4:                 # Port 4 | 배지수분 23.8%, EC 1.37 (가장 높음)
+        soil_temp: soil_temp__rep3
+        vwc: vwc__rep3
+        ec: ec__rep3
+
+  # PYR + ATMOS 14 + TEROS 12 ×1 — 배지센서 1조뿐. 배지수분 평균 11.7%(건조)
+  z6-07680:
+    zone: ""
+    shared: [temp, rh, solar]
+    treatments:
+      z6-07680-P3:                 # Port 3 (이 로거의 유일한 배지 처리구)
+        soil_temp: soil_temp
+        vwc: vwc
+        ec: ec
+
+  # SQ-521 ×2 + ATMOS 14 + TEROS 12 ×3 — 야간보광 구역(야간 PPFD 81% 시점에서 검출)
+  #   ※ Port 2·3 TEROS 는 전 구간 0 = 미연결. 복구 전까지 배지자료 없음.
+  #   ※ 광센서와 배지센서의 짝(어느 SQ-521 이 어느 배지 처리구인지)은 설치 기록이
+  #     필요하므로 임의로 묶지 않고 각각 별도 슬롯으로 둔다. 짝을 알면 한 블록으로 합칠 것.
+  z6-20400:
+    zone: ""
+    shared: [temp, rh]
+    treatments:
+      z6-20400-P2:                 # Port 2 TEROS — 미연결(전 구간 0)
+        soil_temp: soil_temp__rep1
+        vwc: vwc__rep1
+        ec: ec__rep1
+      z6-20400-P3:                 # Port 3 TEROS — 미연결(전 구간 0)
+        soil_temp: soil_temp__rep2
+        vwc: vwc__rep2
+        ec: ec__rep2
+      z6-20400-P4:                 # Port 4 TEROS — 정상, 배지수분 32.0%
+        soil_temp: soil_temp__rep3
+        vwc: vwc__rep3
+        ec: ec__rep3
+      z6-20400-P1광:               # Port 1 SQ-521 — 야간 중앙 23.5 µmol
+        ppfd: ppfd__rep1
+      z6-20400-P5광:               # Port 5 SQ-521 — 야간 중앙 44.2 µmol(등기구에 더 가까움)
+        ppfd: ppfd__rep2
+
+  # TEROS 12 ×4 + PYR + SQ-521 (기온·습도 없음), 야간 광 없음
+  z6-20917:
+    zone: ""
+    shared: [ppfd, solar]
+    treatments:
+      z6-20917-P1:                 # Port 1 | 배지수분 27.0% (가장 낮음)
+        soil_temp: soil_temp__rep1
+        vwc: vwc__rep1
+        ec: ec__rep1
+      z6-20917-P2:                 # Port 2 | 배지수분 29.2%
+        soil_temp: soil_temp__rep2
+        vwc: vwc__rep2
+        ec: ec__rep2
+      z6-20917-P3:                 # Port 3 | 배지수분 41.0% (가장 높음)
+        soil_temp: soil_temp__rep3
+        vwc: vwc__rep3
+        ec: ec__rep3
+      z6-20917-P4:                 # Port 4 | 배지수분 36.3%
+        soil_temp: soil_temp__rep4
+        vwc: vwc__rep4
+        ec: ec__rep4

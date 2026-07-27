@@ -39,9 +39,10 @@ loggers:
     model: METER ZL6
     first_seen: '2026-05-28'
     last_seen: '2026-06-08'
-    files: 1
+    files: 2
     recent_files:
     - z6-20400_086260936.xlsx
+    - 20260727_a45e13_z6-20400_086260936.xlsx
   z6-20917:
     zone: ''
     model: METER ZL6

@@ -16,6 +16,7 @@
 자동 인식하고, 표준 변수가 아닌 열(수온·pH·풍속 등)도 버리지 않고 집계·감시한다.
 
 📖 **대시보드 사용법(설치·화면 설명)**: [`docs/dashboard_guide.md`](docs/dashboard_guide.md)
+📥 **코드를 내 컴퓨터로 가져오기(GitHub 처음이신 분)**: [`docs/github_guide.md`](docs/github_guide.md)
 
 ```
 로거 파일(.xlsx/.csv, 기종·간격 무관, 여러 대·여러 번)
@@ -31,7 +32,10 @@
    ├─▶ [모니터링] 13종 QC 규칙 → 알림(콘솔/파일/Slack/메일) + 일일 리포트
    │              scripts/run_monitor.py · src/qc_rules.py · src/alerts.py
    │
-   ├─▶ [대시보드] 4개 탭(모니터링·전처리·센서검증·설정)
+   ├─▶ [주간 업데이트] 쌓기·점검·정리를 명령 한 줄로 + 회차별 결과 보관
+   │              scripts/weekly_update.py · src/store.py
+   │
+   ├─▶ [대시보드] 5개 탭(상태점검·결과만들기·쌓인자료·센서점검·설정)
    │              app/streamlit_app.py
    │
    └─▶ [센서 검증] 기한 관리 · 상호비교 · 드리프트 추적
@@ -47,7 +51,7 @@ pip install -r requirements.txt
 
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
-python tests/test_pipeline.py           # 31/31 통과
+python tests/test_pipeline.py           # 32/32 통과
 
 # 1) 통합 — 보유한 모든 환경데이터를 하나로 (새 파일 받으면 다시 실행만)
 python scripts/build_archive.py --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive
@@ -65,6 +69,12 @@ python scripts/run_all_loggers.py --archive outputs/archive --by-treatment \
 
 # 2) 모니터링 — 아카이브 전체를 로거별로 점검 + 알림
 python scripts/run_monitor.py --archive outputs/archive --by-logger --lookback 7
+
+# 2-1) 매주 이것 하나면 끝 — 쌓기 + 점검 + 정리 + 회차 보관
+#      조사일 기준은 처음 한 번만 주면 config/survey.yaml 에 기억된다
+python scripts/weekly_update.py --env "data/신규/*" \
+       --survey-start 2026-04-01 --survey-interval 10 --survey-count 12
+python scripts/weekly_update.py --env "data/신규/*"      # 다음 주부터는 이것만
 
 # 3) 대시보드
 streamlit run app/streamlit_app.py
@@ -152,17 +162,17 @@ pip install -r requirements.txt
 streamlit run app/streamlit_app.py     # 터미널에 뜨는 http://localhost:8501 접속
 ```
 
-왼쪽 사이드바에 로거 파일을 넣으면(업로드 또는 서버 경로) 아래 4개 탭이 채워진다.
-사이드바의 **🔍 자동 인식 결과 / 수정**에서 시간 열·기록 간격·인식 변수를 확인하고,
-틀렸을 때만 열의 의미를 직접 지정한다. 화면별 상세 안내는
-[`docs/dashboard_guide.md`](docs/dashboard_guide.md) 및 각 탭의 **❓ 이 화면 보는 법**.
+화면은 **할 일 순서**로 되어 있다 — 왼쪽 사이드바 `1단계 자료 넣기` 에 파일을 올리면
+아래 탭이 채워진다. 전문용어는 화면에 쓰지 않는다(규칙 코드·열 이름은 `app/ui_text.py`
+에서 사람 말로 옮긴다). 화면별 상세 안내는 [`docs/dashboard_guide.md`](docs/dashboard_guide.md).
 
 | 탭 | 기능 |
 |---|---|
-| 📊 모니터링 | 센서 상태 카드, 알림 목록, 일자별 결측률 히트맵, 시계열, 즉시 발송 |
-| 🔁 전처리 | 시차·창 설정 → 일별/구간/병합 결과 미리보기 + CSV·Excel 다운로드, 환경↔생육 상관 |
-| 🔬 센서 검증 | 검증 기한 현황, 상호비교(bias·MAE·r·판정), 검증 기록 입력, 드리프트 추이 |
-| ⚙️ 설정 | 임계값 확인, 알림 채널 상태, 테스트 발송 |
+| 2️⃣ 상태 점검 | 한 줄 결론 → 규칙별로 묶은 알림(뜻·조치 포함), 항목별 상태, 결측 히트맵, 시계열, 즉시 발송 |
+| 3️⃣ 결과 만들기 | 조사 날짜만 지정 → 구간 정의·구간별 환경·생육 병합 + CSV·Excel 다운로드, 회차 저장 |
+| 📦 쌓인 자료 | 올린 파일을 보관함에 누적, 구역별 현황·업로드 이력, **지난 회차 결과 다시 받기** |
+| 🔬 센서 점검 | 점검 기한, 두 센서 비교(bias·MAE·r·판정), 점검 기록, 드리프트 추이 |
+| ⚙️ 설정 | 로거번호↔구역 이름 지정, 임계값 확인, 알림 채널 상태·테스트 발송 |
 
 ---
 
@@ -192,6 +202,7 @@ streamlit run app/streamlit_app.py     # 터미널에 뜨는 http://localhost:85
 config/qc_config.yaml          임계값·알림·검증주기 (단일 설정 지점)
 config/sensor_map.yaml         포트 ↔ 처리구 매핑 (처리구별 집계용)
 config/logger_registry.yaml    로거 일련번호 ↔ 구역 이름 등록부 (자동 기억)
+config/survey.yaml             조사일 기준 기억(weekly_update.py 가 자동 생성)
 src/io_logger.py               ZL6 형식 읽기, 열 표준화, 10분 격자 정합
 src/preprocess.py              일별·구간 집계, 시차 매칭, 범위 이탈 처리
 src/qc_rules.py                QC 규칙 13종 + 센서 상태표
@@ -200,14 +211,17 @@ src/sensor_check.py            검증 로그·기한·상호비교·드리프트
 src/sensor_map.py              센서↔처리구 매핑, 처리구 분리
 src/archive.py                 전체 환경데이터 통합·구역 병합·증분 업데이트
 src/registry.py                로거번호 ↔ 구역 등록부
+src/store.py                   주간 보관함(원본 누적·중복 방지) · 회차별 결과 보관
 scripts/build_archive.py       전체 환경데이터 통합 아카이브 생성/갱신
 scripts/run_preprocess.py      전처리 CLI(조사일 직접 지정 가능)
 scripts/run_all_loggers.py     로거 일괄 전처리 + 통합 산출물
 scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
+scripts/weekly_update.py       주간 업데이트(쌓기·점검·정리) 한 줄 실행
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
-tests/                         합성 자료 생성기 + 검증 테스트 31종
+tests/                         합성 자료 생성기 + 검증 테스트 32종
 docs/dashboard_guide.md        대시보드 사용법(설치·화면별 안내)
+docs/github_guide.md           코드 내려받기·업데이트 안내(GitHub 입문)
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식
 ```

@@ -656,6 +656,52 @@ def test_zone_column_collision():
     print("✓ 구역 내 동일 변수 열 분리 보존")
 
 
+def test_weekly_store_accumulates():
+    """매주 올린 파일이 보관함에 쌓이고, 같은 파일은 다시 넣지 않는다."""
+    import tempfile
+    from src import store
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        reg_path = tmp / "registry.yaml"
+        week1 = tmp / "z6-55555_wk1.xlsx"
+        _write_logger_file(week1, "2026-05-01", 144, "10min")
+        st_dir = tmp / "store"
+
+        r1 = store.add_files([str(week1)], CFG, st_dir, registry_path=reg_path)
+        assert (r1["uploads"]["상태"] == "새로 보관").all()
+        assert r1["before"] == 0 and r1["after"] == 144
+        assert len(store.stored_files(st_dir)) == 1
+
+        # 같은 파일을 다시 올려도 보관·행수 모두 그대로
+        r2 = store.add_files([str(week1)], CFG, st_dir, registry_path=reg_path)
+        assert (r2["uploads"]["상태"] == "이미 있음").all()
+        assert r2["added"] == 0 and r2["after"] == 144
+        assert len(store.stored_files(st_dir)) == 1
+
+        # 다음 주 자료는 이어붙는다
+        week2 = tmp / "z6-55555_wk2.xlsx"
+        _write_logger_file(week2, "2026-05-02", 144, "10min")
+        r3 = store.add_files([str(week2)], CFG, st_dir, registry_path=reg_path)
+        assert r3["before"] == 144 and r3["after"] == 288 and r3["added"] == 144
+        assert len(store.load_upload_log(st_dir)) == 2
+
+        # 원본이 남아 있으므로 전체 재통합도 같은 결과
+        r4 = store.add_files([], CFG, st_dir, registry_path=reg_path, rebuild=True)
+        assert len(r4["master"]) == 288
+
+        # 회차별 결과 보관: 저장 → 목록 → 파일 확인
+        iv = pd.DataFrame({"interval_id": [1, 2], "temp_mean": [20.0, 21.0]})
+        res_dir = tmp / "results"
+        f1 = store.save_result({"구간환경": iv}, res_dir, label="1주차")
+        f2 = store.save_result({"구간환경": iv}, res_dir, label="2주차")
+        runs = store.list_results(res_dir)
+        assert len(runs) == 2 and runs.iloc[0]["이름"].endswith("2주차")   # 최근이 위
+        assert (f1 / "구간환경.csv").exists() and (f2 / "전체결과.xlsx").exists()
+        assert len(store.zip_result(f1)) > 0
+    print("✓ 주간 보관함 누적 · 중복 방지 · 회차 결과 보관")
+
+
 def test_judge_tolerance():
     assert sensor_check.judge("temp", 0.3, 20.0, CFG)[0] == "pass"
     assert sensor_check.judge("temp", 0.8, 20.0, CFG)[0] == "fail"

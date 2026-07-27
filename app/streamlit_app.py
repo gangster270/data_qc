@@ -26,13 +26,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src import alerts as alert_mod          # noqa: E402
-from src import archive, io_logger, preprocess, qc_rules, registry, sensor_check, sensor_map   # noqa: E402
+from src import archive, io_logger, preprocess, qc_rules, registry, sensor_check, sensor_map, store  # noqa: E402
 from src.config import PROJECT_ROOT, load_config, resolve_path  # noqa: E402
 import ui_text as T                          # noqa: E402
 
 st.set_page_config(page_title="환경데이터 QC", page_icon="🌱", layout="wide")
 
 STATUS_COLOR = {"정상": "#2e8b57", "주의": "#e08b3a", "위험": "#d64545"}
+
+STORE_DIR = PROJECT_ROOT / "outputs" / "archive"     # 매주 쌓이는 보관함
+RESULTS_DIR = PROJECT_ROOT / "outputs" / "results"   # 회차별 결과
 
 
 # =====================================================================
@@ -145,6 +148,7 @@ if source_mode == "내 컴퓨터 파일":
     if ups:
         payload = [(u.name, u.getvalue()) for u in ups]
         st.session_state["loaded_names"] = [u.name for u in ups]
+        st.session_state["src_payload"] = ("bytes", payload)
         with st.spinner("파일을 읽는 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_bytes(
                 payload, cfg, replicate, overrides_key)
@@ -160,6 +164,7 @@ elif source_mode == "모아둔 전체 자료":
         sub = master_all[master_all["logger"] == pick_zone] if "logger" in master_all else master_all
         sub = sub.drop(columns=[c for c in ("logger", "serial") if c in sub.columns]).dropna(axis=1, how="all")
         st.session_state["loaded_names"] = [f"{pick_zone}.xlsx"]
+        st.session_state["src_payload"] = None      # 이미 보관함 자료
         interval_a = qc_rules.resolve_interval(cfg, sub)
         grid, gap_report = io_logger.reindex_full_grid(sub.reset_index(drop=True), interval_minutes=interval_a)
         map_report = pd.DataFrame()
@@ -185,6 +190,7 @@ else:
             st.session_state["paths"] = paths
     if st.session_state.get("paths"):
         st.session_state["loaded_names"] = [Path(p).name for p in st.session_state["paths"]]
+        st.session_state["src_payload"] = ("paths", list(st.session_state["paths"]))
         with st.spinner("파일을 읽는 중..."):
             grid, map_report, gap_report, ts_report, load_log = load_from_paths(
                 st.session_state["paths"], cfg, replicate, overrides_key)
@@ -267,8 +273,8 @@ if grid is None:
 # =====================================================================
 # 자료가 있을 때 — 단계별 화면
 # =====================================================================
-tab_check, tab_result, tab_sensor, tab_setting = st.tabs(
-    ["2️⃣ 상태 점검", "3️⃣ 결과 만들기", "🔬 센서 점검", "⚙️ 설정"])
+tab_check, tab_result, tab_store, tab_sensor, tab_setting = st.tabs(
+    ["2️⃣ 상태 점검", "3️⃣ 결과 만들기", "📦 쌓인 자료", "🔬 센서 점검", "⚙️ 설정"])
 
 
 # ---------------------------------------------------------------------
@@ -561,6 +567,21 @@ with tab_result:
                                file_name="환경정리결과.xlsx", key="dl_xl2",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
+        # --- 이번 결과를 회차로 남기기 -----------------------------------
+        st.markdown("**이번 결과 남겨두기**")
+        st.caption("여기 저장해 두면 다음 주에 새 자료를 넣어도 이번 주 결과가 그대로 남아 "
+                   "📦 쌓인 자료 탭에서 언제든 다시 내려받을 수 있습니다.")
+        s1, s2 = st.columns([2, 1])
+        label = s1.text_input("이름 붙이기 (선택)", value="",
+                              placeholder="예: 3주차, 6월조사", key="save_label")
+        if s2.button("💾 이번 결과 저장", use_container_width=True, key="save_run"):
+            tables = {"하루별요약": daily, "구간정의": intervals, "구간환경": env_interval}
+            if merged is not None:
+                tables["생육_환경"] = merged
+            folder = store.save_result(tables, RESULTS_DIR, label=label,
+                                       memo=f"조사 {len(intervals)}회")
+            st.success(f"저장했습니다 → `{folder}`  ·  📦 쌓인 자료 탭에서 다시 받을 수 있습니다.")
+
         if merged is not None:
             next_step("내려받은 <code>생육_환경_병합.csv</code> 를 R·엑셀에서 그대로 분석하면 됩니다.")
         else:
@@ -617,6 +638,117 @@ with tab_result:
         if not range_report.empty:
             st.caption("이상한 값 제외: " +
                        ", ".join(f"{r['변수']} {r['결측처리건수']:,}개" for _, r in range_report.iterrows()))
+
+
+# ---------------------------------------------------------------------
+# 쌓인 자료 — 매주 올린 자료를 모아 두고, 지난 결과를 다시 받는 곳
+# ---------------------------------------------------------------------
+with tab_store:
+    st.header("쌓인 자료")
+    st.caption("매주 새 파일을 올릴 때마다 여기에 이어붙습니다. 지난주 결과도 그대로 남습니다.")
+
+    master_path = STORE_DIR / archive.MASTER_NAME
+    has_store = master_path.exists()
+    if has_store:
+        arc_summary = (pd.read_csv(STORE_DIR / archive.SUMMARY_NAME)
+                       if (STORE_DIR / archive.SUMMARY_NAME).exists() else pd.DataFrame())
+        n_rows = sum(1 for _ in open(master_path, encoding="utf-8-sig")) - 1
+        zones = arc_summary["구역"].nunique() if "구역" in arc_summary else 0
+        span = ""
+        if {"시작", "종료"} <= set(arc_summary.columns) and not arc_summary.empty:
+            span = f" · {arc_summary['시작'].min()} ~ {arc_summary['종료'].max()}"
+        verdict(f"구역 {zones}곳 · {n_rows:,}줄이 쌓여 있습니다",
+                f"보관 위치: `{STORE_DIR}`{span}", "ok")
+    else:
+        verdict("아직 쌓인 자료가 없습니다",
+                "아래 버튼으로 지금 올린 파일을 처음 넣어 두면, 다음부터는 새 파일만 올려도 "
+                "여기에 이어붙습니다.", "info")
+
+    # --- 지금 올린 자료를 쌓기 ------------------------------------------
+    st.subheader("① 이번에 올린 자료 넣기")
+    payload = st.session_state.get("src_payload")
+    if not payload:
+        st.info("왼쪽에서 **내 컴퓨터 파일** 또는 **서버 폴더**로 자료를 올리면 여기에 넣을 수 있습니다. "
+                "(‘모아둔 전체 자료’는 이미 쌓여 있는 자료입니다.)")
+    else:
+        kind, items = payload
+        names = [n for n, _ in items] if kind == "bytes" else [Path(p).name for p in items]
+        st.write(f"넣을 파일 **{len(items)}개**: " + ", ".join(names[:6])
+                 + (" …" if len(names) > 6 else ""))
+        b1, b2 = st.columns([1, 2])
+        if b1.button("📦 보관함에 쌓기", type="primary", use_container_width=True):
+            sources = ([(io.BytesIO(b), n) for n, b in items] if kind == "bytes"
+                       else list(items))
+            with st.spinner("자료를 넣고 기존 자료와 합치는 중..."):
+                res = store.add_files(sources, cfg, STORE_DIR)
+            up = res["uploads"]
+            n_new = int((up["상태"] == "새로 보관").sum()) if not up.empty else 0
+            n_dup = len(up) - n_new
+            msg = f"**{n_new}개**를 새로 넣었습니다."
+            if n_dup:
+                msg += f" {n_dup}개는 전에 넣은 것과 같아 건너뛰었습니다."
+            if res["added"] > 0:
+                msg += f"\n\n쌓인 자료: {res['before']:,}줄 → **{res['after']:,}줄** (+{res['added']:,})"
+            elif n_new:
+                msg += "\n\n기간이 겹쳐서 줄 수는 늘지 않았습니다(같은 시각은 한 줄로 합쳐집니다)."
+            st.success(msg)
+            with st.expander("자세한 처리 내용"):
+                for line in res.get("log", []):
+                    st.write("- " + line)
+            st.rerun()
+        b2.caption("같은 파일을 두 번 올려도 중복되지 않습니다. 기간이 겹쳐도 "
+                   "같은 구역·같은 시각은 한 줄로 합쳐집니다.")
+
+    # --- 보관함 현황 ------------------------------------------------------
+    if has_store:
+        st.subheader("② 지금까지 쌓인 자료")
+        if not arc_summary.empty:
+            keep = [c for c in ("구역", "로거번호", "시작", "종료", "기간(일)", "관측행",
+                                "기록간격(분)", "변수수") if c in arc_summary.columns]
+            st.dataframe(arc_summary[keep], use_container_width=True, hide_index=True)
+        ulog = store.load_upload_log(STORE_DIR)
+        if not ulog.empty:
+            with st.expander(f"올린 파일 이력 ({len(ulog)}개)"):
+                st.dataframe(ulog[["올린날짜", "파일명", "크기(KB)"]].iloc[::-1],
+                             use_container_width=True, hide_index=True, height=240)
+        d1, d2 = st.columns(2)
+        with d1:
+            if st.checkbox("전체 자료 내려받기 준비", key="prep_master",
+                           help="파일이 크면 준비에 시간이 걸립니다."):
+                clean_path = STORE_DIR / archive.CLEAN_NAME
+                use = clean_path if clean_path.exists() else master_path
+                st.download_button(f"⬇ 쌓인 자료 전체 ({use.stat().st_size / 1e6:.1f}MB)",
+                                   use.read_bytes(), file_name="쌓인자료_전체.csv",
+                                   mime="text/csv", use_container_width=True)
+        with d2:
+            st.caption("왼쪽 사이드바에서 **모아둔 전체 자료**를 고르면 여기 쌓인 자료로 "
+                       "바로 점검·정리를 할 수 있습니다.")
+
+    # --- 지난 회차 결과 ---------------------------------------------------
+    st.subheader("③ 지난 결과 다시 받기")
+    runs = store.list_results(RESULTS_DIR)
+    if runs.empty:
+        st.info("아직 저장된 결과가 없습니다. **3️⃣ 결과 만들기** 화면 맨 아래 "
+                "‘💾 이번 결과 저장’을 누르면 여기에 회차별로 쌓입니다.")
+    else:
+        st.dataframe(runs[["저장시각", "이름", "구간수", "메모"]],
+                     use_container_width=True, hide_index=True, height=200)
+        pick = st.selectbox("어느 회차를 받을까요?", runs["이름"].tolist(),
+                            help="최근 저장한 것이 맨 위입니다.")
+        folder = runs.loc[runs["이름"] == pick, "폴더"].iloc[0]
+        files = store.result_files(folder)
+        if files:
+            cols = st.columns(min(3, len(files)))
+            for i, f in enumerate(files):
+                cols[i % len(cols)].download_button(
+                    f"⬇ {f.name}", f.read_bytes(), file_name=f.name,
+                    key=f"dl_run_{i}", use_container_width=True)
+        else:
+            st.warning("그 회차 폴더에 파일이 없습니다.")
+
+    next_step("매주 같은 일을 명령 한 줄로 끝내려면 "
+              "<code>python scripts/weekly_update.py --env \"data/신규/*\"</code> "
+              "— 쌓기·점검·정리를 한 번에 하고 회차 폴더까지 남깁니다.")
 
 
 # ---------------------------------------------------------------------

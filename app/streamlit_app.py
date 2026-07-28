@@ -857,31 +857,100 @@ with tab_setting:
     st.header("설정")
 
     st.subheader("🏷️ 로거 번호 ↔ 구역 이름")
-    st.caption("같은 로거는 파일 이름이 달라져도 번호로 알아봅니다. "
-               "여기서 구역 이름을 한 번 정해 두면 다음부터 자동으로 그 구역으로 묶입니다.")
+    st.caption("**구역 칸을 직접 눌러 이름을 적고, 아래 [구역 이름 저장]을 누르세요.** "
+               "한 번 정해 두면 파일 이름이 매번 달라져도 그 번호는 계속 같은 구역으로 묶입니다.")
     reg = registry.load_registry()
-    table = registry.as_table(reg)
-    if table.empty:
-        st.info("아직 등록된 로거가 없습니다. 파일을 한 번 통합하면 자동으로 등록됩니다.")
+    loggers = dict(reg.get("loggers") or {})
+    if not loggers:
+        st.info("아직 등록된 로거가 없습니다. 파일을 한 번 넣으면 자동으로 등록됩니다.")
     else:
-        st.dataframe(table, use_container_width=True, hide_index=True)
-        unnamed = [s for s, e in (reg.get("loggers") or {}).items()
-                   if not str((e or {}).get("zone", "")).strip()]
-        if unnamed:
-            st.warning(f"구역 이름이 없는 로거 {len(unnamed)}대: {', '.join(unnamed)}")
-        z1, z2, z3 = st.columns([2, 2, 1])
-        pick_serial = z1.selectbox("로거 번호", list((reg.get("loggers") or {}).keys()), key="zone_serial")
-        cur = str(((reg.get("loggers") or {}).get(pick_serial) or {}).get("zone", ""))
-        new_zone = z2.text_input("이 로거는 어느 구역인가요?", value=cur, key="zone_name",
-                                 placeholder="예: 3구역, 1온실-A")
-        z3.write("")
-        if z3.button("저장", key="zone_save", use_container_width=True):
-            registry.set_zone(reg, pick_serial, new_zone)
+        # 현장에서 어느 로거인지 알아볼 수 있게 '재는 항목'을 붙여 준다
+        measured = {}
+        sum_path = STORE_DIR / archive.SUMMARY_NAME
+        if sum_path.exists():
+            asum = pd.read_csv(sum_path)
+            for _, r in asum.iterrows():
+                names = ", ".join(T.var_name(v.strip())
+                                  for v in str(r.get("변수", "")).split(",") if v.strip())
+                for s in str(r.get("로거번호", "")).split(","):
+                    measured[s.strip()] = names
+
+        edit_df = pd.DataFrame([{
+            "일련번호": s,
+            "구역": str((e or {}).get("zone", "") or ""),
+            "기종": (e or {}).get("model", ""),
+            "재는 항목": measured.get(s, ""),
+            "최초": (e or {}).get("first_seen", ""),
+            "최근": (e or {}).get("last_seen", ""),
+        } for s, e in loggers.items()])
+
+        edited = st.data_editor(
+            edit_df, use_container_width=True, hide_index=True, key="zone_editor",
+            column_config={
+                "일련번호": st.column_config.TextColumn("일련번호", disabled=True),
+                "구역": st.column_config.TextColumn(
+                    "구역 ✏️", help="여기에 이름을 적으세요. 예: 3구역, 1온실-A",
+                    max_chars=40),
+                "기종": st.column_config.TextColumn("기종", disabled=True),
+                "재는 항목": st.column_config.TextColumn("재는 항목", disabled=True, width="medium"),
+                "최초": st.column_config.TextColumn("최초", disabled=True),
+                "최근": st.column_config.TextColumn("최근", disabled=True),
+            })
+
+        z1, z2 = st.columns([1, 2])
+        if z1.button("💾 구역 이름 저장", type="primary", use_container_width=True, key="zone_save"):
+            changed = []
+            for _, r in edited.iterrows():
+                s, new = str(r["일련번호"]), str(r["구역"] or "").strip()
+                if new != str((loggers.get(s) or {}).get("zone", "") or ""):
+                    registry.set_zone(reg, s, new)
+                    changed.append(f"{s} → {new or '(미지정)'}")
             registry.save_registry(reg)
-            st.success(f"{pick_serial} → {new_zone or '(미지정)'} 저장했습니다.")
             st.cache_data.clear()
+            if changed:
+                st.session_state["zone_changed"] = changed
             st.rerun()
-        st.caption("여러 로거에 **같은 구역 이름**을 주면 한 구역 자료로 합쳐집니다.")
+        z2.caption("여러 로거에 **같은 이름**을 주면 그 로거들이 한 구역 자료로 합쳐집니다 "
+                   "(예: 배지 센서 로거와 광 센서 로거를 둘 다 `3구역`).")
+
+        if st.session_state.get("zone_changed"):
+            st.success("저장했습니다 — " + " · ".join(st.session_state["zone_changed"]))
+            st.warning("**이미 쌓아 둔 자료는 아직 예전 이름으로 묶여 있습니다.** "
+                       "아래 단추를 눌러야 새 구역 이름대로 다시 묶입니다.")
+
+        # 이름을 바꾸면 쌓인 자료를 새 이름대로 다시 묶어야 한다
+        if (STORE_DIR / archive.MASTER_NAME).exists():
+            n_orig = len(store.stored_files(STORE_DIR))
+            r1, r2 = st.columns([1, 2])
+            if r1.button("🔄 쌓인 자료 다시 묶기", use_container_width=True, key="zone_rebuild",
+                         disabled=n_orig == 0):
+                with st.spinner("보관된 원본으로 전부 다시 계산하는 중... (자료가 많으면 몇 분 걸립니다)"):
+                    res = store.add_files([], cfg, STORE_DIR, rebuild=True)
+                if res.get("rebuilt"):
+                    st.session_state.pop("zone_changed", None)
+                    zones = (res["master"]["logger"].nunique()
+                             if not res["master"].empty and "logger" in res["master"] else 0)
+                    st.success(f"다시 묶었습니다 — 구역 {zones}곳 · {len(res['master']):,}줄")
+                    st.cache_data.clear()
+                else:
+                    st.error("\n\n".join(res.get("log", ["다시 계산하지 못했습니다."])))
+            if n_orig:
+                r2.caption(f"보관해 둔 **원본 {n_orig}개로 처음부터 다시 계산**합니다. "
+                           "자료는 상하지 않고, 몇 번을 눌러도 결과는 같습니다. "
+                           "쌓인 자료가 줄어들 상황이면 아무것도 바꾸지 않고 알려 줍니다.")
+            else:
+                r2.warning("보관된 원본이 없습니다(터미널에서 만든 자료). 📦 쌓인 자료 탭에서 "
+                           "원본 파일을 한 번 넣어 두면, 그 뒤로는 구역 이름을 바꿀 때마다 "
+                           "여기서 다시 묶을 수 있습니다.")
+            st.caption("새로 올리는 파일은 **다시 묶기를 하지 않아도** 여기 정한 구역 이름으로 들어갑니다.")
+        else:
+            st.caption("아직 쌓아 둔 자료가 없습니다. 📦 쌓인 자료 탭에서 파일을 넣으면 "
+                       "여기 정한 구역 이름대로 묶입니다.")
+
+        unnamed = [s for s, e in loggers.items() if not str((e or {}).get("zone", "")).strip()]
+        if unnamed:
+            st.info(f"아직 이름이 없는 로거 {len(unnamed)}대: {', '.join(unnamed)} "
+                    "— 비워 두어도 번호 그대로 따로 관리되니 아는 것부터 채우면 됩니다.")
 
     st.divider()
     st.subheader("경보 기준")

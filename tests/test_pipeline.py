@@ -659,7 +659,7 @@ def test_zone_column_collision():
 def test_weekly_store_accumulates():
     """매주 올린 파일이 보관함에 쌓이고, 같은 파일은 다시 넣지 않는다."""
     import tempfile
-    from src import store
+    from src import archive, store
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -679,16 +679,45 @@ def test_weekly_store_accumulates():
         assert r2["added"] == 0 and r2["after"] == 144
         assert len(store.stored_files(st_dir)) == 1
 
+        # 숫자만으로 된 로거번호(HOBO)도 저장·재로딩 후 같은 구역으로 인식되어
+        # 다시 올렸을 때 행이 늘지 않는다
+        hobo = tmp / "260703_22094002.csv"
+        ts = pd.date_range("2026-05-01", periods=144, freq="10min")
+        pd.DataFrame({"Timestamp": ts,
+                      "PAR, µmol/m²/s (LGR S/N: 22094002)": np.linspace(0, 900, 144)}
+                     ).to_csv(hobo, index=False, encoding="utf-8-sig")
+        h1 = store.add_files([str(hobo)], CFG, st_dir, registry_path=reg_path)
+        rows_with_hobo = h1["after"]
+        # 다음 주에 '처음부터 전부' 다시 내려받아 올린다 — 겹치는 144행은 늘면 안 되고
+        # 새로 늘어난 144행만 추가돼야 한다
+        hobo2 = tmp / "260710_22094002.csv"
+        ts2 = pd.date_range("2026-05-01", periods=288, freq="10min")
+        pd.DataFrame({"Timestamp": ts2,
+                      "PAR, µmol/m²/s (LGR S/N: 22094002)": np.linspace(0, 900, 288)}
+                     ).to_csv(hobo2, index=False, encoding="utf-8-sig")
+        h2 = store.add_files([str(hobo2)], CFG, st_dir, registry_path=reg_path)
+        assert h2["added"] == 144, h2["added"]
+        assert h2["master"].duplicated(["logger", "timestamp"]).sum() == 0
+        rows_with_hobo = h2["after"]
+
         # 다음 주 자료는 이어붙는다
         week2 = tmp / "z6-55555_wk2.xlsx"
         _write_logger_file(week2, "2026-05-02", 144, "10min")
         r3 = store.add_files([str(week2)], CFG, st_dir, registry_path=reg_path)
-        assert r3["before"] == 144 and r3["after"] == 288 and r3["added"] == 144
-        assert len(store.load_upload_log(st_dir)) == 2
+        assert r3["added"] == 144 and r3["after"] == rows_with_hobo + 144
+        assert len(store.load_upload_log(st_dir)) == 4, len(store.load_upload_log(st_dir))
 
         # 원본이 남아 있으므로 전체 재통합도 같은 결과
         r4 = store.add_files([], CFG, st_dir, registry_path=reg_path, rebuild=True)
-        assert len(r4["master"]) == 288
+        assert r4["rebuilt"] and len(r4["master"]) == rows_with_hobo + 144
+
+        # 보관함에 없는 로거가 마스터에 있으면 재통합을 거부한다(자료 소실 방지)
+        outside = tmp / "z6-99999_direct.xlsx"
+        _write_logger_file(outside, "2026-05-03", 144, "10min")
+        archive.build_archive([str(outside)], CFG, st_dir, update=True, registry_path=reg_path)
+        r5 = store.add_files([], CFG, st_dir, registry_path=reg_path, rebuild=True)
+        assert not r5["rebuilt"] and len(r5["master"]) == rows_with_hobo + 288  # 그대로 보존
+        assert "z6-99999" in r5["log"][0]
 
         # 회차별 결과 보관: 저장 → 목록 → 파일 확인
         iv = pd.DataFrame({"interval_id": [1, 2], "temp_mean": [20.0, 21.0]})

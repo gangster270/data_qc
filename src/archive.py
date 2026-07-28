@@ -127,6 +127,11 @@ def merge_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     merged = pd.concat(frames, ignore_index=True, sort=False)
     merged["timestamp"] = pd.to_datetime(merged["timestamp"], errors="coerce")
     merged = merged.dropna(subset=["timestamp"])
+    # 구역·번호는 반드시 문자열로 — 숫자만인 로거번호(22094002)가 파일을 오갈 때
+    # int 와 str 로 갈리면 같은 구역이 둘로 쪼개져 중복이 정리되지 않는다
+    for c in ("logger", "serial"):
+        if c in merged.columns:
+            merged[c] = merged[c].astype(str)
     merged = merged.sort_values(ID_COLS, kind="stable")
     # groupby.first() 는 NaN 을 건너뛰므로 결측이 있는 쪽이 다른 쪽 값으로 채워진다
     serials = None
@@ -252,7 +257,8 @@ def build_archive(sources: list, cfg: dict, out_dir: str | Path,
     prev_path = out_dir / MASTER_NAME
     prev_rows = 0
     if update and prev_path.exists():
-        prev = pd.read_csv(prev_path, parse_dates=["timestamp"])
+        prev = pd.read_csv(prev_path, parse_dates=["timestamp"],
+                           dtype={"logger": str, "serial": str})
         prev_rows = len(prev)
         frames.append(prev)
         log.append(f"기존 마스터 이어받기: {prev_rows:,}행")
@@ -287,7 +293,8 @@ def load_master(path: str | Path, clean: bool = False) -> pd.DataFrame:
     path = Path(path)
     if path.is_dir():
         path = path / (CLEAN_NAME if clean else MASTER_NAME)
-    df = pd.read_csv(path, parse_dates=["timestamp"])
+    df = pd.read_csv(path, parse_dates=["timestamp"],
+                     dtype={"logger": str, "serial": str})
     return df.sort_values([c for c in ID_COLS if c in df.columns]).reset_index(drop=True)
 
 

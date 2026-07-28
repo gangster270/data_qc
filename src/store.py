@@ -111,6 +111,67 @@ def stored_files(store_dir: str | Path) -> list[str]:
 # ---------------------------------------------------------------------
 # 보관 + 누적 통합을 한 번에
 # ---------------------------------------------------------------------
+def _serials_in(master: pd.DataFrame) -> set:
+    """마스터에 들어 있는 로거 일련번호 집합(한 행에 여러 대면 '+' 로 이어져 있다)."""
+    if master is None or master.empty or "serial" not in master.columns:
+        return set()
+    return {s.strip() for cell in master["serial"].dropna().astype(str)
+            for s in cell.split("+") if s.strip()}
+
+
+def _rebuild(store: Path, cfg: dict, uploads: pd.DataFrame, before: int,
+             replicate: str, registry_path) -> dict:
+    """보관된 원본으로 전부 다시 계산한다 — 단, 자료가 줄어들면 되돌린다.
+
+    보관함을 거치지 않고(CLI 로 data/ 를 직접 읽어) 만든 마스터가 있을 수 있다.
+    그 상태에서 그냥 다시 계산하면 보관된 원본만 남아 **자료가 사라진다**.
+    그래서 임시 폴더에 먼저 만들어 보고, 기존 로거를 모두 담고 있을 때만 바꾼다.
+    """
+    targets = stored_files(store)
+    master_path = store / archive.MASTER_NAME
+    old = archive.load_master(store) if master_path.exists() else pd.DataFrame()
+
+    if not targets:
+        return {"uploads": uploads, "master": old, "clean": pd.DataFrame(),
+                "summary": pd.DataFrame(), "files": pd.DataFrame(), "registry": {},
+                "range_report": pd.DataFrame(), "collisions": pd.DataFrame(),
+                "log": ["보관된 원본이 없어 다시 계산하지 않았습니다. "
+                        "원본을 한 번 넣어 두면(📦 보관함에 쌓기) 이후 언제든 다시 계산할 수 있습니다."],
+                "before": before, "after": before, "added": 0, "rebuilt": False,
+                "out_dir": store}
+
+    tmp = store / ".rebuild"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    res = archive.build_archive(targets, cfg, tmp, replicate=replicate,
+                                update=False, registry_path=registry_path)
+
+    missing = _serials_in(old) - _serials_in(res["master"])
+    if missing:
+        shutil.rmtree(tmp, ignore_errors=True)
+        res.update({
+            "master": old, "clean": pd.DataFrame(), "summary": pd.DataFrame(),
+            "log": [f"다시 계산하지 않았습니다 — 보관된 원본에 없는 로거 {len(missing)}대"
+                    f"({', '.join(sorted(missing)[:5])}{' 외' if len(missing) > 5 else ''})의 "
+                    f"자료가 사라지기 때문입니다. 그 로거의 원본 파일도 보관함에 넣은 뒤 "
+                    f"다시 눌러 주세요. 지금 쌓인 자료는 그대로 있습니다."],
+            "before": before, "after": before, "added": 0, "rebuilt": False,
+            "uploads": uploads, "out_dir": store})
+        return res
+
+    for f in tmp.iterdir():
+        if f.is_file():
+            shutil.move(str(f), str(store / f.name))
+    shutil.rmtree(tmp, ignore_errors=True)
+    res["uploads"] = uploads
+    res["before"] = before
+    res["after"] = len(res["master"])
+    res["added"] = res["after"] - before
+    res["rebuilt"] = True
+    res["out_dir"] = store
+    return res
+
+
 def add_files(sources: list, cfg: dict, store_dir: str | Path,
               replicate: str = "first", registry_path: str | Path | None = None,
               rebuild: bool = False) -> dict:
@@ -133,9 +194,8 @@ def add_files(sources: list, cfg: dict, store_dir: str | Path,
     new_paths = list(uploads.attrs.get("added_paths", []))
 
     if rebuild:
-        targets, update = stored_files(store), False
-    else:
-        targets, update = new_paths, True
+        return _rebuild(store, cfg, uploads, before, replicate, registry_path)
+    targets, update = new_paths, True
 
     if not targets:
         # 새로 들어온 것이 없다 — 기존 마스터를 그대로 돌려준다
@@ -144,7 +204,7 @@ def add_files(sources: list, cfg: dict, store_dir: str | Path,
                 "summary": pd.read_csv(store / archive.SUMMARY_NAME) if (store / archive.SUMMARY_NAME).exists() else pd.DataFrame(),
                 "files": pd.DataFrame(), "log": ["새로 들어온 파일이 없습니다(이미 보관된 자료)."],
                 "registry": {}, "range_report": pd.DataFrame(),
-                "collisions": pd.DataFrame(),
+                "collisions": pd.DataFrame(), "rebuilt": False,
                 "before": before, "after": before, "added": 0, "out_dir": store}
 
     res = archive.build_archive(targets, cfg, store, replicate=replicate,

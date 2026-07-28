@@ -13,33 +13,38 @@ loggers:
     model: METER ZL6
     first_seen: '2026-05-28'
     last_seen: '2026-07-03'
-    files: 2
+    files: 6
     recent_files:
     - 7구역-z6-21068_086260931.xlsx
     - 7구역-z6-21068_037260945.xlsx
+    - 20260728_4b1ba2_7구역-z6-21068_086260931.xlsx
+    - 20260728_5b833c_7구역-z6-21068_037260945.xlsx
   z6-03959:
     zone: ''
     model: METER ZL6
     first_seen: '2026-01-30'
-    last_seen: '2026-07-03'
-    files: 2
+    last_seen: '2026-06-08'
+    files: 6
     recent_files:
     - z6-03959_086260946.xlsx
     - z6-03959_037260914.xlsx
+    - 20260728_0d1e3d_z6-03959_037260914.xlsx
+    - 20260728_c69b33_z6-03959_086260946.xlsx
   z6-07680:
     zone: ''
     model: METER ZL6
     first_seen: '2026-01-30'
     last_seen: '2026-06-08'
-    files: 1
+    files: 3
     recent_files:
     - z6-07680_086260943.xlsx
+    - 20260728_0542d6_z6-07680_086260943.xlsx
   z6-20400:
     zone: ''
     model: METER ZL6
     first_seen: '2026-05-28'
     last_seen: '2026-06-08'
-    files: 2
+    files: 4
     recent_files:
     - z6-20400_086260936.xlsx
     - 20260727_a45e13_z6-20400_086260936.xlsx
@@ -48,30 +53,34 @@ loggers:
     model: METER ZL6
     first_seen: '2026-05-28'
     last_seen: '2026-06-08'
-    files: 1
+    files: 3
     recent_files:
     - z6-20917_086260934.xlsx
+    - 20260728_050e2e_z6-20917_086260934.xlsx
   '22061061':
     zone: ''
     model: HOBO
     first_seen: '2025-05-19'
     last_seen: '2026-07-03'
-    files: 1
+    files: 3
     recent_files:
     - 260703_22061061.csv
+    - 20260728_2a9305_260703_22061061.csv
   '22094002':
     zone: ''
     model: HOBO
     first_seen: '2025-05-19'
     last_seen: '2026-07-03'
-    files: 1
+    files: 3
     recent_files:
     - 260703_22094002.csv
+    - 20260728_eddee3_260703_22094002.csv
   PAR1-22070169:
     zone: ''
     model: HOBO
     first_seen: '2025-06-09'
     last_seen: '2026-07-03'
-    files: 1
+    files: 3
     recent_files:
     - 260703_PAR122070169.csv
+    - 20260728_d8659d_260703_PAR122070169.csv

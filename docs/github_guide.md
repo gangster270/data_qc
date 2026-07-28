@@ -11,14 +11,68 @@
 
 ---
 
+## 🍎 맥(macOS)에서 설치·실행 — 이대로 한 줄씩
+
+맥에서 가장 많이 막히는 세 곳을 미리 피하는 순서입니다.
+
+1. **`pip` 라는 명령은 맥에 없다** → `python3 -m pip` 또는 아래처럼 전용 공간을 만들어 쓴다
+2. **`Library/Mobile Documents` 처럼 경로에 띄어쓰기가 있으면 명령이 끊긴다**
+3. **iCloud 폴더(`com~apple~CloudDocs`)에서는 돌리면 안 된다** — 안 쓰는 파일을 자동으로
+   내려버려서 실행 중에 파일이 사라진 것처럼 된다. **홈 폴더로 옮긴다.**
+
+```bash
+# 1) 파이썬이 있는지 확인 — 'Python 3.x.x' 가 나오면 통과
+python3 --version
+#    없다고 나오면 https://www.python.org/downloads/ 에서 설치 후 터미널을 껐다 켠다
+
+# 2) 받은 폴더를 iCloud 밖(홈)으로 옮긴다
+mv ~/Library/Mobile\ Documents/com~apple~CloudDocs/data_qc-main ~/data_qc
+cd ~/data_qc
+
+# 3) 이 프로그램 전용 공간을 만들고 켠다 (처음 한 번만)
+python3 -m venv .venv
+source .venv/bin/activate
+#    줄 맨 앞에 (.venv) 가 붙으면 성공 — 이때부터 pip·streamlit 이 그냥 된다
+
+# 4) 설치 (처음 한 번만, 몇 분 걸린다)
+pip install -r requirements.txt
+
+# 5) 실행
+streamlit run app/streamlit_app.py
+```
+
+**다음부터 켤 때는 이 세 줄만:**
+
+```bash
+cd ~/data_qc
+source .venv/bin/activate
+streamlit run app/streamlit_app.py
+```
+
+끄려면 터미널에서 **Control + C**.
+
+| 맥에서 나는 오류 | 뜻·해결 |
+|---|---|
+| `zsh: command not found: pip` | 3번(전용 공간 만들기)을 먼저 한다. 또는 `python3 -m pip` 로 부른다 |
+| `zsh: command not found: streamlit` | 아직 설치 전이다. 4번을 실행한다 |
+| `no such file or directory: /Users/.../Mobile` | 경로의 띄어쓰기에서 끊긴 것. 위 2번처럼 `Mobile\ Documents` 로 쓰거나 경로를 `"..."` 로 감싼다 |
+| `externally-managed-environment` | 전용 공간(`.venv`) 없이 설치하려 해서 나는 것. 3번을 먼저 한다 |
+| `zsh: command not found: python3` | 파이썬 미설치. python.org 에서 설치 후 터미널 재시작 |
+
+---
+
 ## 방법 A. 압축파일로 받기 (가장 쉬움 · git 몰라도 됨)
 
 1. 브라우저에서 <https://github.com/gangster270/data_qc> 접속
 2. 오른쪽 초록색 **`< > Code`** 단추 → **`Download ZIP`**
 3. 받은 zip 을 풀고, 그 폴더에서 실행
 
-```bash
-cd 압축을푼폴더
+맥이라면 위 **🍎 맥에서 설치·실행** 순서를 그대로 따르시면 됩니다.
+윈도우는 압축을 푼 폴더에서:
+
+```cmd
+py -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app/streamlit_app.py
 ```
@@ -38,9 +92,12 @@ git 이 없으면 먼저 설치합니다 — <https://git-scm.com/downloads>
 ```bash
 git clone https://github.com/gangster270/data_qc.git
 cd data_qc
+python3 -m venv .venv && source .venv/bin/activate    # 맥·리눅스
 pip install -r requirements.txt
 streamlit run app/streamlit_app.py
 ```
+
+> 홈 폴더처럼 **iCloud 밖**, 그리고 **띄어쓰기 없는 경로**에 받으세요.
 
 ### 이미 `data_qc` 폴더가 있다면
 
@@ -55,6 +112,7 @@ git pull
 ```bash
 cd data_qc
 git pull
+source .venv/bin/activate        # 맥·리눅스
 streamlit run app/streamlit_app.py
 ```
 
@@ -69,7 +127,7 @@ streamlit run app/streamlit_app.py
 |---|---|
 | `git: command not found` | git 미설치 → <https://git-scm.com/downloads> |
 | `python: command not found` | 파이썬 미설치 → <https://www.python.org/downloads/> (설치 때 *Add to PATH* 체크) |
-| `streamlit: command not found` | `pip install -r requirements.txt` 를 먼저 실행 |
+| `streamlit: command not found` | `.venv` 를 켰는지(`source .venv/bin/activate`) 확인하고 `pip install -r requirements.txt` 실행 |
 | 화면이 그대로 | 브라우저 **F5**. 그래도 그대로면 터미널에서 **Ctrl+C** 후 다시 `streamlit run ...` |
 | 지금 어느 갈래인지 모르겠음 | `git branch --show-current` → `main` 이면 최신 |
 | `Your local changes would be overwritten` | 내 컴퓨터에서 코드를 고친 상태입니다. `git stash` 입력 후 다시 `git pull` |

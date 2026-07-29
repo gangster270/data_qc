@@ -6,4 +6,5 @@ XlsxWriter>=3.1      # Excel 리포트 쓰기
 PyYAML>=6.0          # config/qc_config.yaml
 streamlit>=1.30      # 모니터링 대시보드
 altair>=5.0          # 대시보드 차트
-requests>=2.31       # Slack/Teams webhook 알림
+requests>=2.31       # Slack webhook · 카카오톡 '나에게 보내기' 알림
+PyGithub>=2.1        # 결과·설정 GitHub 자동 저장 (선택 — 없어도 나머지는 동작)

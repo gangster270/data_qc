@@ -29,6 +29,8 @@ DEFAULT_CONFIG = {
         "daytime_hours": [9, 15],
         "lag_days": 0,
         "window_days": None,
+        "missing_method": "keep",          # keep | interpolate | drop
+        "missing_limit_minutes": 60,       # 이 시간 이내의 짧은 결측만 보간
     },
     "sensors": {
         "temp": {"label": "온도", "unit": "℃", "min": -40, "max": 80, "flat_minutes": 360, "spike": 5.0},
@@ -75,8 +77,16 @@ DEFAULT_CONFIG = {
         "cooldown_hours": 12,
         "state_file": "outputs/alert_state.json",
         "report_dir": "outputs/reports",
-        "channels": {"console": True, "file": True, "slack": False, "email": False},
+        "channels": {"console": True, "file": True, "slack": False, "email": False, "kakao": False},
         "email": {"sender": "noreply@example.org", "recipients": [], "subject_prefix": "[환경데이터 QC]"},
+        "kakao": {"link_url": "https://github.com/gangster270/data_qc"},
+    },
+    "github": {
+        "enabled": False,
+        "repo": "",                        # "gangster270/data_qc"
+        "branch": "main",
+        "base_dir": "outputs",             # 레포 안 저장 경로
+        "commit_prefix": "[자동] 환경데이터",
     },
     "verification": {
         "log_file": "outputs/sensor_verification_log.csv",

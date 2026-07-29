@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src import alerts as alert_mod          # noqa: E402
-from src import archive, io_logger, preprocess, qc_rules, registry, sensor_check, sensor_map, store  # noqa: E402
+from src import archive, github_sync, io_logger, preprocess, qc_rules, registry, sensor_check, sensor_map, store  # noqa: E402
 from src.config import PROJECT_ROOT, load_config, resolve_path  # noqa: E402
 import ui_text as T                          # noqa: E402
 
@@ -344,6 +344,101 @@ with tab_check:
         st.checkbox("참고 항목도 보기", key="show_info")
         df_download(alerts, "⬇ 점검 결과 내려받기(CSV)", f"점검결과_{datetime.now():%Y%m%d}.csv", "dl_alerts")
 
+    # --- 항목별 지표 카드 + 스파크라인 -----------------------------------
+    # 표를 읽기 전에 "지금 어느 센서가 이상한지"를 눈으로 먼저 잡게 한다.
+    st.subheader("한눈에 보기")
+    if not health.empty:
+        import altair as alt
+
+        recent = grid[grid["timestamp"] > grid["timestamp"].max() - pd.Timedelta(days=3)]
+        alert_vars = set(alerts["variable"]) if not alerts.empty else set()
+        cards = health.head(8).reset_index(drop=True)
+        for start in range(0, len(cards), 4):
+            row = cards.iloc[start:start + 4]
+            for col, (_, r) in zip(st.columns(len(row)), row.iterrows()):
+                var, state = r["키"], r["상태"]
+                spec = cfg["sensors"].get(var, {})
+                unit = spec.get("unit", "")
+                icon = {"정상": "🟢", "주의": "🟠", "위험": "🔴"}.get(state, "⚪")
+                with col:
+                    latest = r["최근값"]
+                    st.metric(
+                        f"{icon} {T.var_name(var)}",
+                        f"{latest:,.1f}{unit}" if pd.notna(latest) else "—",
+                        delta=(f"수신 {r['수신율']:.0%}" if pd.notna(r["수신율"]) else None),
+                        delta_color="inverse" if state != "정상" else "off")
+                    # 스파크라인 — 최근 3일 흐름. 문제가 있는 항목은 빨갛게.
+                    spark = recent[["timestamp", var]].dropna() if var in recent else pd.DataFrame()
+                    if len(spark) > 1:
+                        color = "#d64545" if (state != "정상" or var in alert_vars) else "#2e8b57"
+                        st.altair_chart(
+                            alt.Chart(spark).mark_line(color=color, strokeWidth=1.5).encode(
+                                x=alt.X("timestamp:T", axis=None),
+                                y=alt.Y(f"{var}:Q", axis=None,
+                                        scale=alt.Scale(zero=False, nice=False)),
+                                tooltip=[alt.Tooltip("timestamp:T", title="시각"),
+                                         alt.Tooltip(f"{var}:Q", title=T.var_name(var), format=".1f")]
+                            ).properties(height=48).configure_view(strokeWidth=0),
+                            use_container_width=True)
+                    else:
+                        st.caption("최근 3일 자료 없음")
+        st.caption("작은 그래프는 최근 3일 흐름입니다. **빨간 선은 점검이 필요한 항목**입니다.")
+
+    # --- 이상 발생 구간을 그래프에 빨갛게 표시 ----------------------------
+    st.subheader("이상이 난 구간 확인")
+    if alerts.empty:
+        st.success(f"최근 {int(lookback)}일 동안 표시할 이상 구간이 없습니다.")
+    else:
+        import altair as alt
+
+        hl_vars = [v for v in qc_rules.value_columns(grid)
+                   if v in set(alerts["variable"]) and grid[v].notna().any()]
+        if not hl_vars:
+            st.caption("특정 항목에 묶이지 않는 알림(기록 누락 등)이라 그래프로 표시할 것이 없습니다.")
+        else:
+            hv = st.selectbox("어느 항목을 볼까요?", hl_vars, format_func=T.var_name, key="hl_var")
+            win = grid[grid["timestamp"] > grid["timestamp"].max() - pd.Timedelta(days=int(lookback))]
+            series = win[["timestamp", hv]].dropna()
+
+            spec = cfg["sensors"].get(hv, {})
+            base = alt.Chart(series).mark_line(color="#2f6fb0", strokeWidth=1.2).encode(
+                x=alt.X("timestamp:T", title=None),
+                y=alt.Y(f"{hv}:Q", title=f"{T.var_name(hv)} ({spec.get('unit', '')})",
+                        scale=alt.Scale(zero=False)),
+                tooltip=[alt.Tooltip("timestamp:T", title="시각"),
+                         alt.Tooltip(f"{hv}:Q", title=T.var_name(hv), format=".2f")])
+            layers = [base]
+
+            # 이상 구간을 빨간 띠로. 시작=끝인 순간 알림은 폭을 조금 줘야 보인다.
+            bands = alerts[(alerts["variable"] == hv) & alerts["start"].notna()].copy()
+            if not bands.empty:
+                bands["end"] = bands["end"].fillna(bands["start"])
+                same = bands["end"] <= bands["start"]
+                bands.loc[same, "end"] = bands.loc[same, "start"] + pd.Timedelta(minutes=30)
+                bands["규칙"] = bands["rule"].map(T.rule_title)
+                layers.insert(0, alt.Chart(bands).mark_rect(
+                    color="#d64545",
+                    opacity=0.22).encode(
+                        x="start:T", x2="end:T",
+                        tooltip=[alt.Tooltip("규칙:N"), alt.Tooltip("level:N", title="등급"),
+                                 alt.Tooltip("message:N", title="내용")]))
+
+            # 허용 범위선 — 값이 어디를 넘었는지 바로 보이게
+            if "min" in spec and "max" in spec:
+                lim = pd.DataFrame({"y": [spec["min"], spec["max"]], "구분": ["가능한 최소", "가능한 최대"]})
+                lim = lim[(lim["y"] >= series[hv].min() - abs(series[hv].min() or 1)) &
+                          (lim["y"] <= series[hv].max() + abs(series[hv].max() or 1))]
+                if not lim.empty:
+                    layers.append(alt.Chart(lim).mark_rule(
+                        color="#d64545", strokeDash=[4, 4], strokeWidth=1).encode(
+                            y="y:Q", tooltip=["구분:N", "y:Q"]))
+
+            st.altair_chart(alt.layer(*layers).properties(height=300).interactive(),
+                            use_container_width=True)
+            n_band = len(bands)
+            st.caption(f"🟥 빨간 띠 = 이상이 감지된 시간대({n_band}구간). 띠 위에 마우스를 올리면 "
+                       "무슨 문제인지 나옵니다. 빨간 점선은 센서가 낼 수 있는 값의 한계입니다.")
+
     # --- 항목별 상태 ---------------------------------------------------
     st.subheader("항목별 상태")
     if not health.empty:
@@ -432,10 +527,61 @@ with tab_result:
         drop_incomplete = s5.checkbox("자료가 많이 빈 날 제외",
                                       value=bool(pcfg.get("drop_incomplete_days", False)))
 
+        # --- 빈 칸(결측)을 어떻게 다룰지 -------------------------------
+        st.markdown("**빈 칸(결측)이 있을 때**")
+        miss_labels = {
+            "keep": "그대로 두기 — 빈 칸을 빼고 평균냅니다 (기본)",
+            "interpolate": "짧게 빈 곳만 앞뒤 값으로 채우기 (선형보간)",
+            "drop": "빈 칸이 있는 줄은 아예 빼기",
+        }
+        default_method = str(pcfg.get("missing_method", "keep"))
+        opts = list(miss_labels)
+        miss_method = st.radio(
+            "처리 방법", opts,
+            index=opts.index(default_method) if default_method in opts else 0,
+            format_func=lambda k: miss_labels[k], key="miss_method")
+        miss_limit = 60.0
+        if miss_method == "interpolate":
+            miss_limit = st.slider(
+                "몇 분까지 채울까요?", 10, 360,
+                int(pcfg.get("missing_limit_minutes", 60)), step=10,
+                help="이 시간보다 길게 빈 구간은 채우지 않고 빈 칸으로 둡니다.")
+            st.caption("💡 PPFD·일사량은 **하루치를 더해서** 광량(DLI)을 내기 때문에, "
+                       "잠깐 빈 곳을 비워 두면 그날 광량이 실제보다 적게 나옵니다. "
+                       "반대로 반나절씩 빈 곳을 직선으로 이으면 **없던 자료를 지어내는 것**이라 "
+                       "짧게 빈 곳만 채우는 것이 안전합니다.")
+        elif miss_method == "drop":
+            st.warning("센서 한 개만 고장나도 그 시간대 **모든 항목**이 함께 빠집니다. "
+                       "센서끼리 값을 맞춰 봐야 할 때만 쓰세요.")
+
     clean = grid.drop(columns=["qc_status"])
     range_report = pd.DataFrame()
     if mask_range:
         clean, range_report = preprocess.mask_out_of_range(clean, cfg["sensors"])
+
+    # 결측 처리는 범위이탈값을 지운 뒤에 한다 (-99.9 를 먼저 결측으로 만든 다음 채워야 함)
+    n_before_fill = len(clean)
+    clean, miss_report = preprocess.fill_missing(
+        clean, method=miss_method, limit_minutes=float(miss_limit),
+        interval_minutes=ts_report.get("interval_minutes"))
+    if not miss_report.empty and miss_method != "keep":
+        if miss_method == "interpolate":
+            n_filled = int(miss_report["채운건수"].sum())
+            n_left = int(miss_report["남은결측"].sum())
+            if n_filled:
+                st.info(f"짧게 빈 곳 **{n_filled:,}개**를 채웠습니다"
+                        + (f" · 길게 빈 곳 {n_left:,}개는 그대로 두었습니다." if n_left else "."))
+            else:
+                st.caption("채울 만큼 짧게 빈 곳이 없었습니다.")
+        else:
+            n_dropped = n_before_fill - len(clean)
+            ratio = n_dropped / max(n_before_fill, 1)
+            msg = f"빈 칸이 있는 **{n_dropped:,}줄**을 뺐습니다 (전체의 {ratio:.1%})."
+            if ratio > 0.2:
+                msg += " 자료가 너무 많이 빠졌습니다 — '그대로 두기'를 권합니다."
+            st.warning(msg)
+        with st.expander("항목별 결측 처리 내역"):
+            st.dataframe(miss_report, use_container_width=True, hide_index=True)
 
     daily_kwargs = dict(
         interval_minutes=ts_report.get("interval_minutes", None),
@@ -581,6 +727,35 @@ with tab_result:
             folder = store.save_result(tables, RESULTS_DIR, label=label,
                                        memo=f"조사 {len(intervals)}회")
             st.success(f"저장했습니다 → `{folder}`  ·  📦 쌓인 자료 탭에서 다시 받을 수 있습니다.")
+
+        # --- GitHub 에도 같이 올려두기 -----------------------------------
+        gh_st = github_sync.status(cfg)
+        with st.expander("☁️ GitHub 에도 올려두기" +
+                         ("" if gh_st["ready"] else " (아직 준비 안 됨)")):
+            if not gh_st["ready"]:
+                st.info(f"{gh_st['reason']}\n\n"
+                        "설정 탭 맨 아래 **GitHub 자동 저장**에서 준비 방법을 확인하세요.")
+            else:
+                st.caption(f"`{gh_st['repo']}` 의 `{gh_st['branch']}` 브랜치 · "
+                           f"`{gh_st['base_dir']}/` 아래에 날짜 폴더로 쌓입니다. "
+                           "같은 파일을 다시 올려도 예전 내용이 기록으로 남습니다.")
+                g1, g2 = st.columns([2, 1])
+                gh_folder = g1.text_input("올릴 폴더 이름", value=f"{date.today():%Y-%m-%d}",
+                                          key="gh_folder")
+                if g2.button("☁️ GitHub 에 올리기", use_container_width=True, key="gh_push"):
+                    tables = {"daily_env_summary": daily, "env_intervals": intervals,
+                              "env_interval_summary": env_interval}
+                    if merged is not None:
+                        tables["merged_env_growth"] = merged
+                    with st.spinner("올리는 중..."):
+                        res = github_sync.push_result_bundle(
+                            tables, cfg, folder=gh_folder.strip() or None,
+                            message=f"{gh_folder} 결과 (구간 {len(intervals)}개)")
+                    if res["ok"]:
+                        st.success(f"{res['n_pushed']}개 파일을 올렸습니다.")
+                    else:
+                        st.error("올리지 못했습니다.")
+                    st.code("\n".join(res["log"]))
 
         if merged is not None:
             next_step("내려받은 <code>생육_환경_병합.csv</code> 를 R·엑셀에서 그대로 분석하면 됩니다.")
@@ -970,9 +1145,35 @@ with tab_setting:
 
     st.subheader("알림 보내는 곳")
     ch = cfg["alerts"].get("channels", {})
-    st.write(pd.DataFrame([{"채널": k, "켜짐": "✅" if v else "—"} for k, v in ch.items()]))
-    st.caption("Slack 은 `SLACK_WEBHOOK_URL`, 메일은 `SMTP_*` 환경변수를 넣은 뒤 "
-               "설정 파일에서 켜면 됩니다.")
+    CHANNEL_HELP = {
+        "console": "화면(터미널)에 출력", "file": "파일로 기록(outputs/reports)",
+        "slack": "환경변수 `SLACK_WEBHOOK_URL`", "email": "환경변수 `SMTP_HOST/PORT/USER/PASSWORD`",
+        "kakao": "환경변수 `KAKAO_ACCESS_TOKEN` (또는 `KAKAO_REST_API_KEY`+`KAKAO_REFRESH_TOKEN`)",
+    }
+    st.dataframe(
+        pd.DataFrame([{"채널": k, "켜짐": "✅" if v else "—",
+                       "필요한 값": CHANNEL_HELP.get(k, "")} for k, v in ch.items()]),
+        use_container_width=True, hide_index=True)
+    st.caption("환경변수를 넣은 뒤 `config/qc_config.yaml` 의 `alerts.channels` 에서 "
+               "해당 채널을 `true` 로 바꾸면 켜집니다.")
+
+    with st.expander("📱 카카오톡으로 받으려면 (나에게 보내기)"):
+        st.markdown("""
+1. [developers.kakao.com](https://developers.kakao.com) 에서 **애플리케이션 추가**
+2. **카카오 로그인** 활성화 → 동의항목에서 **카카오톡 메시지 전송(`talk_message`)** 켜기
+3. 토큰을 발급받아 컴퓨터에 환경변수로 등록
+
+```bash
+export KAKAO_ACCESS_TOKEN="발급받은_토큰"
+# 자동(예약) 실행이라면 토큰이 6시간마다 만료되므로 아래 두 개를 함께 넣으세요
+export KAKAO_REST_API_KEY="앱_REST_API_키"
+export KAKAO_REFRESH_TOKEN="리프레시_토큰"
+```
+
+카카오톡 메시지는 **200자 제한**이라 "무엇이 몇 건인지"만 요약해서 보냅니다.
+자세한 내용은 메일 리포트나 이 대시보드에서 확인하세요.
+""")
+
     if st.button("시험 삼아 한 통 보내기"):
         test = pd.DataFrame([{
             "rule": "TEST", "level": "INFO", "variable": "-", "label": "테스트",
@@ -982,5 +1183,48 @@ with tab_setting:
         text = alert_mod.format_text(test, cfg, {"start": "-", "end": "-", "n_rows": 0, "n_missing_ts": 0})
         ok_slack = alert_mod.send_slack(text) if ch.get("slack") else None
         ok_mail = alert_mod.send_email("테스트", text, cfg) if ch.get("email") else None
+        ok_kakao = (alert_mod.send_kakao(alert_mod.format_kakao_text(test, cfg))
+                    if ch.get("kakao") else None)
         st.code(text)
-        st.write({"slack": ok_slack, "email": ok_mail})
+        st.write({"slack": ok_slack, "email": ok_mail, "kakao": ok_kakao})
+        st.caption("`None` 은 그 채널이 꺼져 있다는 뜻입니다.")
+
+    st.divider()
+    st.subheader("☁️ GitHub 자동 저장")
+    gh_st = github_sync.status(cfg)
+    if gh_st["ready"]:
+        verdict("저장 준비 완료",
+                f"`{gh_st['repo']}` · `{gh_st['branch']}` 브랜치 · `{gh_st['base_dir']}/` 폴더", "ok")
+    else:
+        verdict("아직 저장할 수 없습니다", gh_st["reason"], "warn")
+
+    st.dataframe(pd.DataFrame([
+        {"항목": "PyGithub 설치", "상태": "✅" if gh_st["has_library"] else "❌ `pip install PyGithub`"},
+        {"항목": "토큰(GITHUB_TOKEN)", "상태": "✅" if gh_st["has_token"] else "❌ 환경변수 없음"},
+        {"항목": "레포 지정", "상태": gh_st["repo"] or "❌ 미지정"},
+    ]), use_container_width=True, hide_index=True)
+
+    if st.button("🔌 연결 확인", key="gh_test"):
+        ok, msg = github_sync.test_connection(cfg)
+        (st.success if ok else st.error)(msg)
+
+    with st.expander("처음 설정하는 방법"):
+        st.markdown("""
+1. GitHub → 우측 상단 프로필 → **Settings** → **Developer settings**
+   → **Personal access tokens** → **Fine-grained tokens** → *Generate new token*
+2. **Repository access** 에서 이 레포만 고르고, **Permissions → Contents: Read and write** 선택
+3. 만들어진 토큰(`github_pat_...`)을 컴퓨터에 환경변수로 등록
+
+```bash
+export GITHUB_TOKEN="github_pat_여기에붙여넣기"
+export GITHUB_REPO="gangster270/data_qc"     # 설정 파일에 적어도 됩니다
+```
+
+4. `config/qc_config.yaml` 의 `github.enabled` 를 `true` 로
+
+**토큰은 비밀번호와 같습니다.** 설정 파일이나 코드에 직접 적지 마세요 —
+그대로 GitHub 에 올라가면 토큰이 공개됩니다.
+
+올릴 때는 결과 표와 함께 **그때 쓴 설정(`qc_config_snapshot.yaml`)** 도 같이 올라갑니다.
+나중에 "이 결과는 어떤 기준으로 계산했더라" 를 되짚을 수 있어야 하기 때문입니다.
+""")

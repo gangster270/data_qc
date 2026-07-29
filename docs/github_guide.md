@@ -145,6 +145,78 @@ streamlit run app/streamlit_app.py
 
 ---
 
+## 결과를 GitHub 에 자동으로 올려두기 (선택)
+
+여기까지는 **코드를 내려받는** 방법이었고, 이번에는 반대로
+**내가 만든 결과를 GitHub 에 올려서 쌓아 두는** 기능입니다.
+
+매주 만든 결과가 담당자 컴퓨터에만 있으면, 담당자나 컴퓨터가 바뀔 때 사라집니다.
+같은 저장소에 계속 올려 두면 **언제 어떤 값이 바뀌었는지**가 기록으로 남습니다.
+
+### 1) 열쇠(토큰) 만들기 — 한 번만
+
+1. GitHub 로그인 → 오른쪽 위 프로필 → **Settings**
+2. 왼쪽 맨 아래 **Developer settings**
+3. **Personal access tokens** → **Fine-grained tokens** → **Generate new token**
+4. 아래 두 가지를 꼭 맞춥니다.
+   - **Repository access** : `Only select repositories` → `data_qc` 선택
+   - **Permissions** → **Repository permissions** → **Contents** 를 `Read and write` 로
+5. 맨 아래 **Generate token** → 나온 문자열(`github_pat_...`)을 복사합니다.
+
+> **이 문자열은 비밀번호와 같습니다.** 창을 닫으면 다시 볼 수 없으니 그 자리에서 등록하세요.
+> 메모장이나 코드 파일에 적어 두면 안 됩니다 — 그대로 GitHub 에 올라가면 남이 씁니다.
+
+### 2) 컴퓨터에 등록하기
+
+맥·리눅스 (터미널):
+
+```bash
+export GITHUB_TOKEN="복사한_github_pat_..."
+export GITHUB_REPO="gangster270/data_qc"
+streamlit run app/streamlit_app.py
+```
+
+윈도우 (PowerShell):
+
+```powershell
+$env:GITHUB_TOKEN="복사한_github_pat_..."
+$env:GITHUB_REPO="gangster270/data_qc"
+streamlit run app/streamlit_app.py
+```
+
+터미널을 껐다 켜면 다시 넣어야 합니다. 매번 넣기 번거로우면 맥에서는
+`~/.zshrc` 파일 맨 아래에 위 `export` 두 줄을 적어 두면 됩니다.
+
+`pip install -r requirements.txt` 를 이미 했다면 필요한 `PyGithub` 도 함께 깔려 있습니다.
+
+### 3) 확인하고 올리기
+
+1. 대시보드 **⚙️ 설정** 탭 맨 아래 **☁️ GitHub 자동 저장** 에서 **🔌 연결 확인**
+   → *"○○ → gangster270/data_qc (main 브랜치) 연결 성공"* 이 나오면 준비 완료
+2. **3️⃣ 결과 만들기** 탭 → **☁️ GitHub 에도 올려두기** → **올리기**
+
+올라가는 모습:
+
+```
+outputs/2026-07-29/daily_env_summary.csv       하루별 요약
+outputs/2026-07-29/env_interval_summary.csv    구간별 환경
+outputs/2026-07-29/merged_env_growth.csv       생육 + 환경 최종 표
+outputs/2026-07-29/qc_config_snapshot.yaml     그때 쓴 기준값
+```
+
+마지막 `qc_config_snapshot.yaml` 은 **그 결과를 어떤 기준으로 계산했는지**를 남기는 파일입니다.
+나중에 값이 달라 보일 때 기준이 바뀐 것인지 자료가 바뀐 것인지 구분할 수 있습니다.
+
+| 이런 말이 나오면 | 뜻·해결 |
+|---|---|
+| `PyGithub 미설치` | `pip install PyGithub` |
+| `토큰 없음` | 위 2) 를 하지 않았거나 터미널을 새로 켰습니다 |
+| `연결 실패: BadCredentials` | 토큰을 잘못 붙여넣었거나 만료됐습니다 — 새로 만드세요 |
+| `쓰기 권한이 없습니다` | 토큰 만들 때 **Contents: Read and write** 를 안 준 경우 |
+| `레포 미지정` | `GITHUB_REPO` 또는 `config/qc_config.yaml` 의 `github.repo` 확인 |
+
+---
+
 ## 참고: 갈래(브랜치)란
 
 저장소 안에는 여러 갈래가 있고, 기본 갈래는 `main` 입니다.

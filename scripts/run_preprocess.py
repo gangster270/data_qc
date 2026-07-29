@@ -84,6 +84,10 @@ def main() -> int:
                     help="중복 센서 처리: first(기본)/mean(평균)/keep(모두 보존)")
     ap.add_argument("--drop-incomplete-days", action="store_true",
                     help="레코드 완전성 기준 미달일을 구간 집계에서 제외")
+    ap.add_argument("--fill-missing", choices=["keep", "interpolate", "drop"], default=None,
+                    help="집계 전 결측 처리: keep(그대로) / interpolate(짧은 결측 선형보간) / drop(결측행 삭제)")
+    ap.add_argument("--fill-limit-minutes", type=float, default=None,
+                    help="선형보간으로 채울 최대 연속 결측 시간(분). 기본 60 — 이보다 긴 구멍은 결측 유지")
     ap.add_argument("--keep-out-of-range", action="store_true",
                     help="센서 물리범위 이탈값을 결측 처리하지 않고 그대로 집계(기본은 결측 처리)")
     ap.add_argument("--by-treatment", action="store_true",
@@ -141,6 +145,22 @@ def main() -> int:
                 print(f"      - {r['변수']}: {r['결측처리건수']:,}건 (허용 {r['허용범위']})")
     else:
         range_report = pd.DataFrame()
+
+    # 결측 처리는 범위 이탈값을 지운 뒤에 한다(-99.9 를 먼저 결측으로 만든 다음 채워야 함)
+    fill_method = args.fill_missing or str(pcfg.get("missing_method", "keep"))
+    fill_limit = (args.fill_limit_minutes if args.fill_limit_minutes is not None
+                  else float(pcfg.get("missing_limit_minutes", 60)))
+    n_rows_before = len(clean)
+    clean, missing_report = preprocess.fill_missing(
+        clean, method=fill_method, limit_minutes=fill_limit, interval_minutes=interval)
+    if fill_method == "interpolate" and not missing_report.empty:
+        n_filled = int(missing_report["채운건수"].sum())
+        n_left = int(missing_report["남은결측"].sum())
+        print(f"    결측 선형보간: {n_filled:,}건 채움 (≤{fill_limit:g}분), "
+              f"{n_left:,}건은 구멍이 길어 결측 유지")
+    elif fill_method == "drop":
+        print(f"    결측 행 삭제: {n_rows_before - len(clean):,}행 제거 "
+              f"({(n_rows_before - len(clean)) / max(n_rows_before, 1):.1%})")
 
     daily_kwargs = dict(
         interval_minutes=interval,
@@ -247,6 +267,8 @@ def main() -> int:
             .to_excel(writer, sheet_name="out_of_range", index=False)
         (gap_report if not gap_report.empty else pd.DataFrame({"note": ["결측 timestamp 없음"]})) \
             .to_excel(writer, sheet_name="missing_timestamp", index=False)
+        (missing_report if not missing_report.empty else pd.DataFrame({"note": ["결측 처리 없음"]})) \
+            .to_excel(writer, sheet_name="missing_handling", index=False)
         pd.DataFrame([{
             "항목": "파일 수", "값": len(paths)}, {
             "항목": "원자료 행", "값": len(raw)}, {
@@ -258,7 +280,9 @@ def main() -> int:
             "항목": "불완전일", "값": n_incomplete}, {
             "항목": "시차(일)", "값": lag_days}, {
             "항목": "고정창(일)", "값": window_days or "가변(직전 조사일~당일)"}, {
-            "항목": "GDD 기준온도", "값": gdd_base},
+            "항목": "GDD 기준온도", "값": gdd_base}, {
+            "항목": "결측 처리", "값": preprocess.MISSING_METHOD_LABELS.get(fill_method, fill_method)}, {
+            "항목": "보간 한계(분)", "값": fill_limit if fill_method == "interpolate" else "-"},
         ]).to_excel(writer, sheet_name="run_summary", index=False)
     print(f"    → {xlsx_path}")
     print("완료.")

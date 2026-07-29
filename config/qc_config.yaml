@@ -24,6 +24,15 @@ preprocess:
   lag_days: 0                   # 시차(일). 환경 구간을 생육 측정일 기준 N일 앞당김
   window_days: null             # null 이면 '직전 측정일 다음날~당일' 가변구간, 숫자면 고정창
 
+  # 집계 전 결측 처리 방식
+  #   keep        : 그대로 두고 결측을 뺀 채 평균/적산 (기본·가장 안전)
+  #   interpolate : missing_limit_minutes 이내의 '짧은' 결측만 선형보간으로 채움
+  #                 → PPFD·일사량은 적산이라 짧은 구멍을 비워 두면 DLI 가 과소평가된다
+  #   drop        : 결측이 있는 행 삭제 (센서 1개만 고장나도 전체가 날아가므로 권장하지 않음)
+  missing_method: keep
+  missing_limit_minutes: 60     # 이 시간을 넘는 연속 결측은 채우지 않고 결측으로 남긴다
+                                # (긴 구멍을 직선으로 이으면 없던 자료를 지어내는 셈)
+
 # ---------------------------------------------------------------------
 # 2. 센서 물리 범위 (out-of-range 판정)
 #    min/max      : 이 범위를 벗어나면 오류값으로 간주
@@ -123,10 +132,26 @@ alerts:
     file: true                  # outputs/reports/alerts_YYYY-MM-DD.jsonl
     slack: false                # SLACK_WEBHOOK_URL 설정 후 true
     email: false                # SMTP_* 설정 후 true
+    kakao: false                # KAKAO_ACCESS_TOKEN(또는 REST_API_KEY+REFRESH_TOKEN) 설정 후 true
   email:
     sender: "noreply@example.org"
     recipients: []              # ["duce270@gmail.com"]
     subject_prefix: "[환경데이터 QC]"
+  kakao:
+    # 카카오톡 '나에게 보내기'. 본문 200자 제한이라 요약만 보내고
+    # 자세한 내용은 아래 링크(대시보드 주소)로 연결한다.
+    link_url: "https://github.com/gangster270/data_qc"
+
+# ---------------------------------------------------------------------
+# 4-1. GitHub 자동 저장 (전처리 결과·설정 스냅샷 커밋)
+#      토큰은 여기 쓰지 말고 환경변수로: GITHUB_TOKEN
+# ---------------------------------------------------------------------
+github:
+  enabled: false                # true 로 바꾸고 토큰을 넣으면 대시보드에서 저장 가능
+  repo: "gangster270/data_qc"   # owner/repo (환경변수 GITHUB_REPO 가 우선)
+  branch: "main"
+  base_dir: "outputs"           # 레포 안에서 결과가 쌓일 폴더
+  commit_prefix: "[자동] 환경데이터"
 
 # ---------------------------------------------------------------------
 # 5. 센서 정기 검증 루틴 주기(일). docs/sensor_verification_routine.md 참조

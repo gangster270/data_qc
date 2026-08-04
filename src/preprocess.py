@@ -79,6 +79,116 @@ def mask_out_of_range(df10: pd.DataFrame, sensors: dict) -> tuple[pd.DataFrame, 
 
 
 # ---------------------------------------------------------------------
+# 결측치 처리 — 그대로 둘 것인가 / 채울 것인가 / 지울 것인가
+# ---------------------------------------------------------------------
+MISSING_METHODS = ("keep", "interpolate", "drop")
+
+MISSING_METHOD_LABELS = {
+    "keep": "그대로 두기(결측 제외하고 평균)",
+    "interpolate": "짧은 결측만 선형보간으로 채우기",
+    "drop": "결측이 있는 행 삭제",
+}
+
+
+def fill_missing(
+    df10: pd.DataFrame,
+    method: str = "keep",
+    limit_minutes: float = 60.0,
+    interval_minutes: float | None = None,
+    columns: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """집계 전 결측치를 어떻게 다룰지 선택한다.
+
+    method
+      "keep"        : 아무것도 하지 않는다. 집계 함수가 결측을 빼고 계산한다(기본값).
+      "interpolate" : **limit_minutes 이내의 짧은 결측만** 시간 기준 선형보간으로 채운다.
+      "drop"        : 대상 변수에 결측이 하나라도 있는 행을 삭제한다.
+
+    왜 limit 을 두는가
+    ------------------
+    센서가 몇 분 튀어 생긴 구멍은 보간해서 채우는 편이 낫다. 특히 PPFD·일사량은
+    적산(DLI)이므로 구멍을 비워 두면 그날 광량이 **실제보다 적게** 나온다.
+    반대로 반나절씩 비어 있는 구간을 직선으로 이으면 **없던 자료를 지어내는 것**이라
+    일출·일몰 곡선이나 관수 주기를 완전히 왜곡한다. 그래서 짧은 결측만 채우고
+    긴 결측은 결측으로 남겨 `completeness`·`quality_flag` 로 드러나게 한다.
+
+    반환: (처리된 자료, 처리 리포트)
+      리포트 열: 변수 / 키 / 처리전결측 / 채운건수 / 남은결측 / 최장연속결측(분)
+    """
+    if df10.empty or method not in MISSING_METHODS:
+        return df10.copy(), pd.DataFrame()
+
+    out = df10.copy().sort_values("timestamp").reset_index(drop=True)
+    if interval_minutes is None:
+        from .io_logger import detect_interval_minutes
+        interval_minutes = detect_interval_minutes(out["timestamp"])
+    interval_minutes = float(interval_minutes) or 10.0
+
+    skip = {"timestamp", "date", "hour", "qc_status", "_source_file", "_serial", "_sheet",
+            "logger", "serial"}
+    targets = [c for c in (columns or out.columns)
+               if c in out.columns and c not in skip and pd.api.types.is_numeric_dtype(out[c])]
+    if not targets:
+        return out, pd.DataFrame()
+
+    # 연속 결측 길이(행 수)를 미리 재 둔다 — 보간 여부와 무관하게 리포트에 남긴다.
+    def _max_run(mask: pd.Series) -> int:
+        if not mask.any():
+            return 0
+        grp = (~mask).cumsum()
+        return int(mask.groupby(grp).sum().max())
+
+    before = {c: out[c].isna() for c in targets}
+    rows = []
+
+    if method == "interpolate":
+        # 허용 연속 결측 행 수. 10분 간격 · 60분 허용 → 최대 6행까지 채운다.
+        limit_n = max(int(round(float(limit_minutes) / interval_minutes)), 1)
+        idx = pd.DatetimeIndex(pd.to_datetime(out["timestamp"]))
+        for c in targets:
+            na = out[c].isna()
+            if not na.any():
+                continue
+            s = pd.Series(out[c].to_numpy(dtype="float64"), index=idx)
+            # limit_area="inside" : 앞뒤로 실측값이 있는 구멍만 채운다.
+            #   → 자료 시작·끝의 결측을 바깥으로 연장(외삽)하지 않는다.
+            filled = s.interpolate(method="time", limit_area="inside")
+
+            # pandas 의 limit= 은 긴 구멍의 '앞쪽 N개'를 채워 버린다. 그러면 8시간
+            # 통신 두절 구간의 앞머리 1시간이 그럴듯한 가짜 값으로 남는다.
+            # 그래서 구멍 전체 길이를 재서 '허용 길이 이하인 구멍만' 통째로 채운다.
+            run_id = (~na).cumsum()
+            run_len = na.groupby(run_id).transform("sum")
+            too_long = na & (run_len > limit_n)
+            values = filled.to_numpy(copy=True)
+            values[too_long.to_numpy()] = np.nan
+            out[c] = values
+
+    elif method == "drop":
+        keep_mask = out[targets].notna().all(axis=1)
+        out = out[keep_mask].reset_index(drop=True)
+
+    for c in targets:
+        n_before = int(before[c].sum())
+        n_after = int(out[c].isna().sum()) if c in out.columns else 0
+        rows.append({
+            "변수": LABELS.get(c, c), "키": c,
+            "처리전결측": n_before,
+            "채운건수": max(n_before - n_after, 0) if method == "interpolate" else 0,
+            "남은결측": n_after,
+            "최장연속결측(분)": round(_max_run(before[c]) * interval_minutes, 1),
+        })
+
+    report = pd.DataFrame(rows)
+    if not report.empty:
+        report.attrs["method"] = method
+        report.attrs["rows_before"] = int(len(df10))
+        report.attrs["rows_after"] = int(len(out))
+        report.attrs["limit_minutes"] = float(limit_minutes)
+    return out, report
+
+
+# ---------------------------------------------------------------------
 # Step 1. 10분 → 일별 요약
 # ---------------------------------------------------------------------
 def to_daily(
@@ -501,8 +611,12 @@ def run_pipeline(
     window_days: int | None = None,
     first_start=None,
     growth_date_col: str = "date",
+    missing_method: str = "keep",
+    missing_limit_minutes: float = 60.0,
 ) -> dict:
     """10분 자료(+생육 자료)를 받아 일별·구간별·병합 결과를 한 번에 만든다.
+
+    missing_method 로 집계 전 결측 처리를 고른다("keep"/"interpolate"/"drop").
 
     반환 dict:
       daily          : 일별 요약
@@ -510,7 +624,12 @@ def run_pipeline(
       env_interval   : 구간별 환경 요약
       merged         : 생육 + 구간환경 병합(생육 자료가 있을 때)
       cadence        : 추정 조사 간격(일)
+      missing_report : 결측 처리 내역(변수별 채운 건수·남은 결측)
     """
+    env10, missing_report = fill_missing(
+        env10, method=missing_method, limit_minutes=missing_limit_minutes,
+        interval_minutes=interval_minutes)
+
     daily = to_daily(
         env10,
         interval_minutes=interval_minutes,
@@ -519,7 +638,7 @@ def run_pipeline(
         daytime_hours=tuple(daytime_hours),
         min_completeness=min_completeness,
     )
-    result = {"daily": daily, "cadence": 0,
+    result = {"daily": daily, "cadence": 0, "missing_report": missing_report,
               "intervals": pd.DataFrame(), "env_interval": pd.DataFrame(), "merged": None}
     if growth is None or growth.empty:
         return result

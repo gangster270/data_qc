@@ -7,4 +7,5 @@ __all__ = [
     "qc_rules",
     "alerts",
     "sensor_check",
+    "github_sync",
 ]

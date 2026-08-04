@@ -731,6 +731,164 @@ def test_weekly_store_accumulates():
     print("✓ 주간 보관함 누적 · 중복 방지 · 회차 결과 보관")
 
 
+# ---------------------------------------------------------------------
+# 결측 처리 (그대로 / 선형보간 / 삭제)
+# ---------------------------------------------------------------------
+def _gap_frame():
+    """10분 간격 24시간 자료에 짧은 구멍(30분)과 긴 구멍(3시간)을 낸다."""
+    ts = pd.date_range("2026-06-01", periods=144, freq="10min")
+    df = pd.DataFrame({"timestamp": ts,
+                       "temp": np.linspace(15, 25, 144),
+                       "ppfd": np.r_[np.zeros(36), np.full(72, 500.0), np.zeros(36)]})
+    df.loc[10:12, "temp"] = np.nan        # 30분 결측(짧음) — 3행
+    df.loc[60:77, "temp"] = np.nan        # 180분 결측(김)  — 18행
+    return df
+
+
+def test_fill_missing_interpolate():
+    df = _gap_frame()
+    out, rep = preprocess.fill_missing(df, method="interpolate",
+                                       limit_minutes=60, interval_minutes=10)
+    row = rep[rep["키"] == "temp"].iloc[0]
+    # 짧은 구멍(3행)만 채우고 긴 구멍(18행)은 결측으로 남겨야 한다.
+    assert row["채운건수"] == 3, row["채운건수"]
+    assert row["남은결측"] == 18, row["남은결측"]
+    assert row["최장연속결측(분)"] == 180.0
+    assert _between(df.loc[9, "temp"], df.loc[13, "temp"], out.loc[11, "temp"])
+    # 원본은 건드리지 않는다
+    assert df["temp"].isna().sum() == 21
+    print("✓ 결측 선형보간 — 짧은 구멍만 채움")
+
+
+def _between(lo, hi, value) -> bool:
+    """보간값이 앞뒤 실측값 사이에 있는지 확인하는 헬퍼."""
+    return min(lo, hi) <= value <= max(lo, hi)
+
+
+def test_fill_missing_keep_and_drop():
+    df = _gap_frame()
+    kept, _ = preprocess.fill_missing(df, method="keep")
+    assert kept["temp"].isna().sum() == 21          # 아무것도 바뀌지 않음
+
+    dropped, rep = preprocess.fill_missing(df, method="drop", interval_minutes=10)
+    assert len(dropped) == 144 - 21
+    assert dropped["temp"].notna().all()
+    assert rep.attrs["rows_after"] == len(dropped)
+    print("✓ 결측 처리 — 그대로 두기 / 행 삭제")
+
+
+def test_fill_missing_no_extrapolation():
+    """자료 시작·끝의 결측은 바깥으로 늘려 채우지 않는다(외삽 금지)."""
+    ts = pd.date_range("2026-06-01", periods=12, freq="10min")
+    df = pd.DataFrame({"timestamp": ts, "temp": [np.nan, np.nan] + [20.0] * 8 + [np.nan, np.nan]})
+    out, _ = preprocess.fill_missing(df, method="interpolate",
+                                     limit_minutes=60, interval_minutes=10)
+    assert out["temp"].isna().sum() == 4
+    print("✓ 결측 보간 — 자료 앞뒤 끝은 외삽하지 않음")
+
+
+def test_interpolation_recovers_dli():
+    """짧은 결측을 채우면 그날 DLI 과소평가가 줄어든다(광은 적산이라 중요)."""
+    full = _gap_frame()
+    holed = full.copy()
+    holed.loc[70:73, "ppfd"] = np.nan            # 주간 40분 결측
+
+    dli_true = preprocess.to_daily(full, interval_minutes=10)["dli"].iloc[0]
+    dli_hole = preprocess.to_daily(holed, interval_minutes=10)["dli"].iloc[0]
+    filled, _ = preprocess.fill_missing(holed, method="interpolate",
+                                        limit_minutes=60, interval_minutes=10)
+    dli_fill = preprocess.to_daily(filled, interval_minutes=10)["dli"].iloc[0]
+
+    assert dli_hole < dli_true                    # 구멍을 비워 두면 과소평가
+    assert abs(dli_fill - dli_true) < abs(dli_hole - dli_true)
+    print(f"✓ 짧은 결측 보간으로 DLI 회복 ({dli_hole:.2f} → {dli_fill:.2f}, 실제 {dli_true:.2f})")
+
+
+def test_run_pipeline_missing_option():
+    df = _gap_frame()
+    growth = pd.DataFrame({"date": pd.to_datetime(["2026-06-01"]), "fresh_wt": [10.0]})
+    res = preprocess.run_pipeline(df, growth, interval_minutes=10,
+                                  missing_method="interpolate", missing_limit_minutes=60,
+                                  first_start=pd.Timestamp("2026-06-01"))
+    assert not res["missing_report"].empty
+    assert int(res["missing_report"]["채운건수"].sum()) == 3
+    print("✓ run_pipeline 결측 처리 옵션 연결")
+
+
+# ---------------------------------------------------------------------
+# 알림 — 카카오톡 요약
+# ---------------------------------------------------------------------
+def test_kakao_text_summary():
+    from src import alerts as alert_mod
+
+    empty = pd.DataFrame(columns=["rule", "level", "variable", "label", "message"])
+    assert "이상 없음" in alert_mod.format_kakao_text(empty, CFG)
+
+    many = pd.DataFrame([{
+        "rule": f"R{i:02d}_rule", "level": "CRITICAL" if i % 2 else "WARN",
+        "variable": "temp", "label": "온도" * 5,
+        "message": "아주 긴 설명 " * 10} for i in range(20)])
+    text = alert_mod.format_kakao_text(many, CFG)
+    # 카카오 텍스트 템플릿은 200자 제한 — 넘으면 발송 자체가 실패한다
+    assert len(text) <= alert_mod.KAKAO_TEXT_LIMIT, len(text)
+    assert "🔴10건" in text and "🟠10건" in text
+    print(f"✓ 카카오톡 요약 200자 제한 준수 ({len(text)}자)")
+
+
+def test_kakao_send_without_token():
+    """토큰이 없으면 예외를 던지지 않고 조용히 False 를 돌려준다."""
+    import os
+
+    from src import alerts as alert_mod
+    saved = {k: os.environ.pop(k, None)
+             for k in ("KAKAO_ACCESS_TOKEN", "KAKAO_REFRESH_TOKEN", "KAKAO_REST_API_KEY")}
+    try:
+        assert alert_mod.send_kakao("테스트") is False
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+    print("✓ 카카오 토큰 없을 때 안전하게 생략")
+
+
+# ---------------------------------------------------------------------
+# GitHub 자동 저장
+# ---------------------------------------------------------------------
+def test_github_status_without_token():
+    import os
+
+    from src import github_sync
+    saved = {k: os.environ.pop(k, None) for k in github_sync.TOKEN_ENVS}
+    try:
+        st = github_sync.status(CFG)
+        assert st["ready"] is False and "토큰" in st["reason"]
+        # 토큰이 없어도 push_files 는 예외 없이 사유를 돌려준다
+        res = github_sync.push_files({"a.csv": pd.DataFrame({"x": [1]})}, CFG)
+        assert res["ok"] is False and res["n_pushed"] == 0 and res["log"]
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+    print("✓ GitHub 토큰 없을 때 안전하게 안내")
+
+
+def test_github_payload_paths():
+    """dry_run 으로 '어디에 무엇이 올라가는지'만 확인한다(실제 커밋 없음)."""
+    import os
+
+    from src import github_sync
+    os.environ["GITHUB_TOKEN"] = "dummy-token-for-dry-run"
+    os.environ["GITHUB_REPO"] = "owner/repo"
+    try:
+        res = github_sync.push_files({"2026-06-01/merged.csv": pd.DataFrame({"x": [1]})},
+                                     CFG, dry_run=True)
+        assert res["ok"] and "outputs/2026-06-01/merged.csv" in res["log"][0]
+    finally:
+        os.environ.pop("GITHUB_TOKEN", None)
+        os.environ.pop("GITHUB_REPO", None)
+    print("✓ GitHub 저장 경로 구성(dry-run)")
+
+
 def test_judge_tolerance():
     assert sensor_check.judge("temp", 0.3, 20.0, CFG)[0] == "pass"
     assert sensor_check.judge("temp", 0.8, 20.0, CFG)[0] == "fail"

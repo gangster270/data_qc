@@ -1,8 +1,9 @@
 """알림 발송 · 중복 억제 · 리포트 생성.
 
-채널: console / file(JSONL) / Slack(Incoming Webhook) / Email(SMTP)
+채널: console / file(JSONL) / Slack(Incoming Webhook) / Email(SMTP) / 카카오톡(나에게 보내기)
 비밀값은 코드·설정파일이 아니라 환경변수에서 읽는다.
     SLACK_WEBHOOK_URL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
+    KAKAO_ACCESS_TOKEN (또는 KAKAO_REST_API_KEY + KAKAO_REFRESH_TOKEN)
 
 중복 억제(cooldown): 같은 key 의 알림은 지정 시간 안에 다시 보내지 않는다.
 현장 운영에서 같은 결측 구간이 매 시간 재발송되면 알림을 무시하게 되므로 필수.
@@ -181,6 +182,102 @@ def send_slack(text: str) -> bool:
         return False
 
 
+# --- 카카오톡 '나에게 보내기' -----------------------------------------
+# 카카오 메시지 API 는 텍스트 템플릿 본문이 200자로 제한된다.
+# 현장에서는 "무엇이 몇 건인지"만 알면 되므로 요약해서 보내고,
+# 자세한 내용은 대시보드·메일 리포트에서 보게 한다.
+KAKAO_TEXT_LIMIT = 200
+KAKAO_SEND_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+KAKAO_TOKEN_URL = "https://kauth.kakao.com/oauth/token"
+
+
+def format_kakao_text(alerts: pd.DataFrame, cfg: dict, context: dict | None = None) -> str:
+    """카카오톡 200자 제한에 맞춘 요약문을 만든다."""
+    site = cfg["site"].get("name", "site")
+    head = f"[{site}] 환경 QC {datetime.now():%m/%d %H:%M}"
+    if alerts.empty:
+        return f"{head}\n이상 없음 — 점검 항목 모두 정상."
+
+    n_crit = int((alerts["level"] == "CRITICAL").sum())
+    n_warn = int((alerts["level"] == "WARN").sum())
+    lines = [f"{head}", f"🔴{n_crit}건 / 🟠{n_warn}건"]
+
+    # 심각한 것부터, 규칙별로 한 줄씩 채우다 글자수에 걸리면 멈춘다.
+    ordered = alerts.sort_values("level", key=lambda s: s.map(LEVEL_ORDER).fillna(0),
+                                 ascending=False)
+    for rule, grp in ordered.groupby("rule", sort=False):
+        r = grp.iloc[0]
+        who = str(r.get("label") or r.get("variable") or "-")
+        extra = f" 외 {len(grp) - 1}건" if len(grp) > 1 else ""
+        line = f"{LEVEL_EMOJI.get(r['level'], '')} {rule}: {who}{extra}"
+        if len("\n".join(lines + [line])) > KAKAO_TEXT_LIMIT - 20:
+            lines.append("…자세한 내용은 대시보드 확인")
+            break
+        lines.append(line)
+    text = "\n".join(lines)
+    return text[:KAKAO_TEXT_LIMIT]
+
+
+def _kakao_access_token() -> str:
+    """액세스 토큰을 얻는다.
+
+    카카오 액세스 토큰은 약 6시간이면 만료된다. 자동 실행(주간 배치·cron)에서는
+    REST_API_KEY + REFRESH_TOKEN 으로 그때그때 새로 발급받아야 알림이 끊기지 않는다.
+    """
+    refresh = os.environ.get("KAKAO_REFRESH_TOKEN", "").strip()
+    rest_key = os.environ.get("KAKAO_REST_API_KEY", "").strip()
+    if refresh and rest_key:
+        try:
+            import requests
+            resp = requests.post(
+                KAKAO_TOKEN_URL, timeout=15,
+                data={"grant_type": "refresh_token", "client_id": rest_key,
+                      "refresh_token": refresh})
+            if resp.status_code < 300:
+                token = resp.json().get("access_token", "")
+                if token:
+                    return token
+            print(f"[알림] 카카오 토큰 갱신 실패({resp.status_code}) — 기존 토큰으로 시도")
+        except Exception as e:
+            print(f"[알림] 카카오 토큰 갱신 실패: {e}")
+    return os.environ.get("KAKAO_ACCESS_TOKEN", "").strip()
+
+
+def send_kakao(text: str, link_url: str | None = None) -> bool:
+    """카카오톡 '나에게 보내기'로 요약 알림을 보낸다.
+
+    사전 준비(한 번만):
+      1) developers.kakao.com 에서 앱 생성 → 카카오 로그인 활성화
+      2) 동의항목에 `talk_message` 추가
+      3) 발급받은 토큰을 환경변수로 등록
+         KAKAO_ACCESS_TOKEN 또는 (KAKAO_REST_API_KEY + KAKAO_REFRESH_TOKEN)
+    """
+    token = _kakao_access_token()
+    if not token:
+        print("[알림] KAKAO_ACCESS_TOKEN 미설정 — 카카오톡 발송 생략")
+        return False
+    url = link_url or "https://developers.kakao.com"
+    template = {
+        "object_type": "text",
+        "text": text[:KAKAO_TEXT_LIMIT],
+        "link": {"web_url": url, "mobile_web_url": url},
+        "button_title": "대시보드 열기",
+    }
+    try:
+        import requests
+        resp = requests.post(
+            KAKAO_SEND_URL, timeout=15,
+            headers={"Authorization": f"Bearer {token}"},
+            data={"template_object": json.dumps(template, ensure_ascii=False)})
+        if resp.status_code >= 300:
+            print(f"[알림] 카카오톡 발송 실패({resp.status_code}): {resp.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[알림] 카카오톡 발송 실패: {e}")
+        return False
+
+
 def send_email(subject: str, body: str, cfg: dict) -> bool:
     ecfg = cfg["alerts"].get("email", {})
     recipients = ecfg.get("recipients") or []
@@ -239,6 +336,10 @@ def dispatch(alerts: pd.DataFrame, cfg: dict, context: dict | None = None,
         n_crit = int((new["level"] == "CRITICAL").sum())
         subject = f"{cfg['site'].get('name', 'site')} 알림 {len(new)}건 (CRITICAL {n_crit})"
         results["channels"]["email"] = send_email(subject, text, cfg)
+    if channels.get("kakao", False):
+        results["channels"]["kakao"] = send_kakao(
+            format_kakao_text(new, cfg, context),
+            link_url=cfg["alerts"].get("kakao", {}).get("link_url"))
 
     mark_sent(state, new, cfg)
     return results

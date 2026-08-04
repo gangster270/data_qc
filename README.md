@@ -1,5 +1,7 @@
 # data_qc — 환경데이터 전처리 · QC 자동 모니터링 · 센서 검증
 
+[![tests](https://github.com/gangster270/data_qc/actions/workflows/tests.yml/badge.svg)](https://github.com/gangster270/data_qc/actions/workflows/tests.yml)
+
 환경 로거 자료(온도·습도·배지온도·배지습도·PPFD·일사량·EC 등)를
 **생육조사 간격(7일·10일)에 맞춰 시차 매칭**하고, **결측·센서오류를 자동 감시**하며,
 **센서 정기 검증 이력을 관리**하는 파이프라인.
@@ -51,7 +53,8 @@ pip install -r requirements.txt
 
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
-python tests/test_pipeline.py           # 32/32 통과
+python tests/test_pipeline.py           # 41/41 통과
+# 같은 검사가 main 으로 가는 PR·푸시마다 GitHub 에서도 자동으로 돈다(아래 8장)
 
 # 1) 통합 — 보유한 모든 환경데이터를 하나로 (새 파일 받으면 다시 실행만)
 python scripts/build_archive.py --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive
@@ -98,6 +101,10 @@ streamlit run app/streamlit_app.py
 - **고정창**: `--window-days 10` → 조사일 직전 10일 고정
 - 조사간격 7·10일은 **자동 추정**, 불규칙 간격도 그대로 처리
 - 범위 이탈값(-99.9 등)은 집계 전에 결측 처리하고 처리 건수를 리포트에 남김
+- **결측 처리 선택**: 그대로 두기(기본) / **짧은 결측만 선형보간** / 결측 행 삭제.
+  보간은 `missing_limit_minutes`(기본 60분) **이하 구멍만 통째로** 채우고 긴 구멍은
+  결측으로 남긴다 — PPFD·일사량은 적산(DLI)이라 짧은 구멍을 비워 두면 광량이 과소평가되고,
+  반대로 반나절을 직선으로 이으면 없던 자료를 지어내는 셈이 되기 때문. 자료 앞뒤 끝은 외삽하지 않음
 - 구간별 `quality_flag` 로 일수부족·레코드결측을 표시 → **플래그 붙은 구간은 분석에서 제외**
 - **처리구별 집계**: 한 로거의 센서가 처리구별로 꽂혀 있으면 `config/sensor_map.yaml` 에
   포트↔처리구를 적고 `--by-treatment` → 생육 자료와 (조사일 × 처리구)로 병합
@@ -130,7 +137,9 @@ R 버전(통계·그래프를 R 에서 이어갈 때): [`R/env_growth_match.R`](
 
 - 등급: INFO / WARN / CRITICAL. 종료코드 0·1·2 로 스케줄러에서 분기 가능.
 - **중복 억제**: 같은 이상은 `cooldown_hours`(기본 12h) 안에 재발송하지 않는다.
-- 알림 채널: 콘솔 · 파일(JSONL) · Slack(`SLACK_WEBHOOK_URL`) · 메일(`SMTP_*`).
+- 알림 채널: 콘솔 · 파일(JSONL) · Slack(`SLACK_WEBHOOK_URL`) · 메일(`SMTP_*`) ·
+  **카카오톡 나에게 보내기**(`KAKAO_ACCESS_TOKEN`, 자동 실행 시 `KAKAO_REST_API_KEY`+`KAKAO_REFRESH_TOKEN`
+  으로 토큰 자동 갱신). 카카오톡은 본문 200자 제한이라 "무엇이 몇 건인지"만 요약해 보낸다.
   비밀값은 설정 파일이 아니라 **환경변수**로 넣는다.
 - 매 실행마다 `outputs/reports/qc_report_YYYY-MM-DD.md` 를 남긴다(알림이 없어도 기록).
 
@@ -168,11 +177,11 @@ streamlit run app/streamlit_app.py     # 터미널에 뜨는 http://localhost:85
 
 | 탭 | 기능 |
 |---|---|
-| 2️⃣ 상태 점검 | 한 줄 결론 → 규칙별로 묶은 알림(뜻·조치 포함), 항목별 상태, 결측 히트맵, 시계열, 즉시 발송 |
-| 3️⃣ 결과 만들기 | 조사 날짜만 지정 → 구간 정의·구간별 환경·생육 병합 + CSV·Excel 다운로드, 회차 저장 |
+| 2️⃣ 상태 점검 | 한 줄 결론 → 규칙별로 묶은 알림(뜻·조치 포함), **지표 카드+스파크라인**, **이상 구간 빨간 띠 그래프**, 항목별 상태, 결측 히트맵, 즉시 발송 |
+| 3️⃣ 결과 만들기 | 조사 날짜만 지정(간격·직접입력·생육파일) → **결측 처리 선택** → 구간별 환경·생육 병합 + CSV·Excel 다운로드, 회차 저장, **GitHub 업로드** |
 | 📦 쌓인 자료 | 올린 파일을 보관함에 누적, 구역별 현황·업로드 이력, **지난 회차 결과 다시 받기** |
 | 🔬 센서 점검 | 점검 기한, 두 센서 비교(bias·MAE·r·판정), 점검 기록, 드리프트 추이 |
-| ⚙️ 설정 | 로거번호↔구역 이름 지정, 임계값 확인, 알림 채널 상태·테스트 발송 |
+| ⚙️ 설정 | 로거번호↔구역 이름 지정, 임계값 확인, 알림 채널 상태·테스트 발송, **GitHub 자동 저장 연결 확인** |
 
 ---
 
@@ -196,7 +205,59 @@ streamlit run app/streamlit_app.py     # 터미널에 뜨는 http://localhost:85
 
 ---
 
-## 6. 구조
+## 6. 외부 연동 — GitHub 자동 저장 · 카카오톡 알림
+
+### 6-1. 결과를 GitHub 에 계속 쌓기
+
+만든 결과가 담당자 PC 에만 남으면 담당자·PC 가 바뀌는 순간 사라진다.
+매주 결과를 같은 레포에 커밋해 두면 **언제 어떤 값이 바뀌었는지**가 이력으로 남는다.
+
+```bash
+pip install PyGithub
+export GITHUB_TOKEN="github_pat_..."      # Fine-grained · 해당 레포 Contents: Read/Write
+export GITHUB_REPO="gangster270/data_qc"  # config/qc_config.yaml 의 github.repo 로도 지정 가능
+```
+
+`config/qc_config.yaml` → `github.enabled: true` 로 바꾸면
+대시보드 **3️⃣ 결과 만들기 → ☁️ GitHub 에도 올려두기** 에서 한 번에 올라간다.
+
+```
+outputs/2026-07-29/daily_env_summary.csv
+outputs/2026-07-29/env_interval_summary.csv
+outputs/2026-07-29/merged_env_growth.csv
+outputs/2026-07-29/qc_config_snapshot.yaml   ← 그때 쓴 기준까지 함께 저장
+```
+
+설정 스냅샷을 같이 올리는 이유는, 나중에 "이 결과는 어떤 임계값으로 계산했더라" 를
+되짚을 수 있어야 하기 때문이다. 코드에서 직접 쓸 때는:
+
+```python
+from src import github_sync
+github_sync.push_result_bundle({"merged_env_growth": merged}, cfg, folder="2026-07-29")
+```
+
+> **토큰은 비밀번호와 같다.** 설정 파일·코드에 직접 적으면 그대로 GitHub 에 공개된다.
+> 반드시 환경변수로 넣는다. 연결 확인은 ⚙️ 설정 탭의 **🔌 연결 확인** 단추로 한다.
+
+### 6-2. 카카오톡으로 즉시 받기
+
+1. [developers.kakao.com](https://developers.kakao.com) 앱 생성 → 카카오 로그인 활성화
+2. 동의항목에 **카카오톡 메시지 전송(`talk_message`)** 추가
+3. 환경변수 등록 후 `alerts.channels.kakao: true`
+
+```bash
+export KAKAO_ACCESS_TOKEN="..."
+# 예약 실행이면 토큰이 6시간마다 만료되므로 아래 두 개를 함께 넣어 자동 갱신
+export KAKAO_REST_API_KEY="..."
+export KAKAO_REFRESH_TOKEN="..."
+```
+
+카카오톡은 본문 **200자 제한**이라 등급별 건수와 급한 항목만 요약해 보내고,
+자세한 내용은 메일 리포트·대시보드에서 본다.
+
+---
+
+## 7. 구조
 
 ```
 config/qc_config.yaml          임계값·알림·검증주기 (단일 설정 지점)
@@ -212,6 +273,7 @@ src/sensor_map.py              센서↔처리구 매핑, 처리구 분리
 src/archive.py                 전체 환경데이터 통합·구역 병합·증분 업데이트
 src/registry.py                로거번호 ↔ 구역 등록부
 src/store.py                   주간 보관함(원본 누적·중복 방지) · 회차별 결과 보관
+src/github_sync.py             결과·설정 스냅샷 GitHub 자동 커밋(PyGithub)
 scripts/build_archive.py       전체 환경데이터 통합 아카이브 생성/갱신
 scripts/run_preprocess.py      전처리 CLI(조사일 직접 지정 가능)
 scripts/run_all_loggers.py     로거 일괄 전처리 + 통합 산출물
@@ -219,12 +281,41 @@ scripts/run_monitor.py         모니터링 CLI(스케줄 실행용)
 scripts/weekly_update.py       주간 업데이트(쌓기·점검·정리) 한 줄 실행
 app/streamlit_app.py           대시보드
 R/env_growth_match.R           R 버전 시차 매칭
-tests/                         합성 자료 생성기 + 검증 테스트 32종
+tests/                         합성 자료 생성기 + 검증 테스트 41종
 docs/dashboard_guide.md        대시보드 사용법(설치·화면별 안내)
 docs/github_guide.md           코드 내려받기·업데이트 안내(GitHub 입문)
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식
+.github/workflows/tests.yml    PR·푸시마다 테스트 자동 실행 (GitHub Actions)
 ```
 
 관련 스킬: `agri-logger-qc`(원자료 QC) · `agri-env-growth-match`(매칭 표준) ·
 `agri-ppfd-gap-fill`(결측 보정) · `agri-stats-workflow`(통계) · `agri-ggplot-style`(그래프)
+
+---
+
+## 8. 자동 검사 (GitHub Actions)
+
+`main` 으로 가는 **PR·푸시마다** 검증 테스트 41종이 GitHub 에서 자동으로 돈다.
+설정은 `.github/workflows/tests.yml` 하나뿐이고, **따로 켜 줄 것은 없다**
+— 이 파일이 `main` 에 들어간 순간부터 동작한다.
+
+| 항목 | 내용 |
+|------|------|
+| 실행 시점 | `main` 으로 가는 PR · `main` 푸시 · Actions 탭에서 수동 실행 |
+| 파이썬 | 3.10 · 3.11 · 3.12 세 버전에서 각각 검사 |
+| 검사 내용 | ① 문법 검사(`app`·`src`·`scripts`·`tests`) → ② 합성 시험자료 생성 → ③ 테스트 41종 |
+| 걸리는 시간 | 세 버전 동시 실행으로 1~2분(실측 버전당 45초) |
+| 결과 확인 | PR 화면 아래 체크 표시, 또는 저장소 **Actions** 탭 |
+
+**결과 읽는 법**
+
+- ✅ 초록 체크 — 41종 모두 통과. 병합해도 된다.
+- ❌ 빨간 X — 눌러서 로그를 열면 `✗ test_이름: 사유` 형태로 **어느 검사가 왜 깨졌는지** 나온다.
+- 🟡 노란 점 — 아직 실행 중.
+
+**로컬에서 똑같이 재현하려면** 위 [빠른 시작](#빠른-시작)의 두 줄을 그대로 실행하면 된다.
+CI 도 정확히 같은 두 줄을 돌린다(`tests/sample/` 은 저장소에 없으므로 매번 새로 만든다).
+
+> 문법 검사를 따로 두는 이유: `app/streamlit_app.py` 는 테스트가 직접 부르지 않아
+> 오타가 나도 테스트만으로는 안 잡힌다. 대시보드를 띄우고 나서야 발견하는 일을 막는다.

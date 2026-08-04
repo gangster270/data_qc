@@ -1,0 +1,53 @@
+name: tests
+
+# main 으로 가는 PR·푸시마다 파이프라인 검증 테스트를 자동으로 돌린다.
+# 로컬에서 하던 두 줄(합성자료 생성 → 테스트)을 그대로 재현한다.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # 필요할 때 Actions 탭에서 수동 실행
+
+permissions:
+  contents: read            # 코드 읽기만 필요(쓰기 권한 없음)
+
+concurrency:
+  # 같은 브랜치에 연달아 푸시하면 이전 실행은 취소해 대기열을 아낀다.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false      # 한 버전이 깨져도 나머지 결과를 끝까지 본다
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: 저장소 내려받기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 ${{ matrix.python-version }} 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip                    # requirements.txt 기준 캐시로 설치 시간 단축
+          cache-dependency-path: requirements.txt
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 문법 검사 (앱·모듈·스크립트)
+        # 테스트가 직접 부르지 않는 Streamlit 앱까지 구문 오류를 잡는다.
+        run: python -m compileall -q app src scripts tests
+
+      - name: 합성 시험자료 생성
+        # tests/sample/ 은 .gitignore 대상이라 저장소에 없다. 매 실행마다 새로 만든다.
+        run: python tests/make_sample_data.py
+
+      - name: 파이프라인 검증 테스트
+        run: python tests/test_pipeline.py

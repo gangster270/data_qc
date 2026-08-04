@@ -1,5 +1,7 @@
 # data_qc — 환경데이터 전처리 · QC 자동 모니터링 · 센서 검증
 
+[![tests](https://github.com/gangster270/data_qc/actions/workflows/tests.yml/badge.svg)](https://github.com/gangster270/data_qc/actions/workflows/tests.yml)
+
 환경 로거 자료(온도·습도·배지온도·배지습도·PPFD·일사량·EC 등)를
 **생육조사 간격(7일·10일)에 맞춰 시차 매칭**하고, **결측·센서오류를 자동 감시**하며,
 **센서 정기 검증 이력을 관리**하는 파이프라인.
@@ -52,6 +54,7 @@ pip install -r requirements.txt
 # 0) 동작 확인용 합성 자료 생성 + 테스트
 python tests/make_sample_data.py
 python tests/test_pipeline.py           # 41/41 통과
+# 같은 검사가 main 으로 가는 PR·푸시마다 GitHub 에서도 자동으로 돈다(아래 8장)
 
 # 1) 통합 — 보유한 모든 환경데이터를 하나로 (새 파일 받으면 다시 실행만)
 python scripts/build_archive.py --env "data/**/*.xlsx" "data/**/*.csv" --out outputs/archive
@@ -283,7 +286,36 @@ docs/dashboard_guide.md        대시보드 사용법(설치·화면별 안내)
 docs/github_guide.md           코드 내려받기·업데이트 안내(GitHub 입문)
 docs/logger_inventory.md       실측 로거 5대 센서 구성·상태 대장
 docs/, cowork/, templates/     사양서·SOP·루틴 프롬프트·양식
+.github/workflows/tests.yml    PR·푸시마다 테스트 자동 실행 (GitHub Actions)
 ```
 
 관련 스킬: `agri-logger-qc`(원자료 QC) · `agri-env-growth-match`(매칭 표준) ·
 `agri-ppfd-gap-fill`(결측 보정) · `agri-stats-workflow`(통계) · `agri-ggplot-style`(그래프)
+
+---
+
+## 8. 자동 검사 (GitHub Actions)
+
+`main` 으로 가는 **PR·푸시마다** 검증 테스트 41종이 GitHub 에서 자동으로 돈다.
+설정은 `.github/workflows/tests.yml` 하나뿐이고, **따로 켜 줄 것은 없다**
+— 이 파일이 `main` 에 들어간 순간부터 동작한다.
+
+| 항목 | 내용 |
+|------|------|
+| 실행 시점 | `main` 으로 가는 PR · `main` 푸시 · Actions 탭에서 수동 실행 |
+| 파이썬 | 3.10 · 3.11 · 3.12 세 버전에서 각각 검사 |
+| 검사 내용 | ① 문법 검사(`app`·`src`·`scripts`·`tests`) → ② 합성 시험자료 생성 → ③ 테스트 41종 |
+| 걸리는 시간 | 버전당 2~4분(세 버전 동시 실행) |
+| 결과 확인 | PR 화면 아래 체크 표시, 또는 저장소 **Actions** 탭 |
+
+**결과 읽는 법**
+
+- ✅ 초록 체크 — 41종 모두 통과. 병합해도 된다.
+- ❌ 빨간 X — 눌러서 로그를 열면 `✗ test_이름: 사유` 형태로 **어느 검사가 왜 깨졌는지** 나온다.
+- 🟡 노란 점 — 아직 실행 중.
+
+**로컬에서 똑같이 재현하려면** 위 [빠른 시작](#빠른-시작)의 두 줄을 그대로 실행하면 된다.
+CI 도 정확히 같은 두 줄을 돌린다(`tests/sample/` 은 저장소에 없으므로 매번 새로 만든다).
+
+> 문법 검사를 따로 두는 이유: `app/streamlit_app.py` 는 테스트가 직접 부르지 않아
+> 오타가 나도 테스트만으로는 안 잡힌다. 대시보드를 띄우고 나서야 발견하는 일을 막는다.
